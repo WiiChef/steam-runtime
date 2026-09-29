@@ -1,0 +1,9 @@
+build/
+prebuilt/
+*.so
+*.apk
+*.png
+
+# private, never commit
+steamclient_patches.conf
+!host/overlay/**/*.png

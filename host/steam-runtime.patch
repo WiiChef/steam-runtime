@@ -1,0 +1,952 @@
+diff --git a/lorie-app/build.gradle b/lorie-app/build.gradle
+index 24961c0..123160e 100644
+--- a/lorie-app/build.gradle
++++ b/lorie-app/build.gradle
+@@ -5,18 +5,39 @@ android {
+     namespace 'com.termux.x11.app'
+     compileSdkVersion 34
+     ndkVersion termuxX11NdkVersion
++
++    signingConfigs {
++        debug {
++            storeFile file('testkey_untrusted.jks')
++            keyAlias 'alias'
++            storePassword 'xrj45yWGLbsO7W0v'
++            keyPassword 'xrj45yWGLbsO7W0v'
++        }
++        standalone {
++            storeFile file('shared-debug.keystore')
++            keyAlias 'androiddebugkey'
++            storePassword 'android'
++            keyPassword 'android'
++        }
++    }
++
+     defaultConfig {
+         applicationId "com.termux.x11"
+         minSdkVersion 24
+         targetSdkVersion 34
+-        versionCode 15
++        versionCode 19
+         versionName termuxX11VersionName
++        signingConfig signingConfigs.debug
+     }
+ 
+     flavorDimensions "uid"
+     productFlavors {
+         standalone {
+             dimension "uid"
++            applicationId "com.steamruntime.dev"
++            targetSdkVersion 28
++            versionCode 24
++            signingConfig signingConfigs.standalone
+         }
+         sharedUid {
+             dimension "uid"
+@@ -24,17 +45,15 @@ android {
+         }
+     }
+ 
+-    signingConfigs.debug {
+-        storeFile file('testkey_untrusted.jks')
+-        keyAlias 'alias'
+-        storePassword 'xrj45yWGLbsO7W0v'
+-        keyPassword 'xrj45yWGLbsO7W0v'
+-    }
+-
+     compileOptions.sourceCompatibility JavaVersion.VERSION_1_9
+     compileOptions.targetCompatibility JavaVersion.VERSION_1_9
++    packagingOptions {
++        jniLibs {
++            useLegacyPackaging true
++        }
++    }
+     buildTypes.debug {
+-        signingConfig signingConfigs.debug
++        signingConfig = null
+         minifyEnabled true
+         shrinkResources true
+         proguardFiles 'proguard-rules.pro'
+@@ -46,7 +65,7 @@ androidComponents {
+     onVariants(selector().all()) { variant ->
+         def name = variant.flavorName == 'standalone' ? variant.buildType : "${variant.flavorName}-${variant.buildType}"
+         variant.outputs.each { output ->
+-            output.outputFileName.set("termux-x11-universal-${name}.apk")
++            output.outputFileName.set("steam-runtime-dev-universal-${name}.apk")
+         }
+     }
+ }
+diff --git a/lorie-app/src/main/AndroidManifest.xml b/lorie-app/src/main/AndroidManifest.xml
+index 6d18a13..6ec2d21 100644
+--- a/lorie-app/src/main/AndroidManifest.xml
++++ b/lorie-app/src/main/AndroidManifest.xml
+@@ -1,5 +1,6 @@
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+     <application
++        android:extractNativeLibs="true"
+         android:icon="@mipmap/lorie_ic_launcher"
+         android:label="@string/lorie_app_name"
+         android:roundIcon="@mipmap/lorie_ic_launcher_round"
+diff --git a/lorie/build.gradle b/lorie/build.gradle
+index 4580acb..ebb5b89 100644
+--- a/lorie/build.gradle
++++ b/lorie/build.gradle
+@@ -39,7 +39,7 @@ android {
+     compileOptions.sourceCompatibility JavaVersion.VERSION_1_9
+     compileOptions.targetCompatibility JavaVersion.VERSION_1_9
+     externalNativeBuild.cmake.path "src/main/cpp/CMakeLists.txt"
+-    packagingOptions.jniLibs.useLegacyPackaging false
++    packagingOptions.jniLibs.useLegacyPackaging true
+     buildFeatures.aidl true
+     buildFeatures.buildConfig true
+ }
+@@ -50,6 +50,7 @@ dependencies {
+     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8:2.4.20"
+     implementation 'androidx.lifecycle:lifecycle-viewmodel-ktx:2.11.0'
+     implementation 'androidx.preference:preference:1.2.1'
++    implementation 'org.apache.commons:commons-compress:1.26.2'
+     compileOnly project(':shell-loader:stub')
+ }
+ afterEvaluate {
+diff --git a/lorie/src/main/AndroidManifest.xml b/lorie/src/main/AndroidManifest.xml
+index f096402..8632e21 100644
+--- a/lorie/src/main/AndroidManifest.xml
++++ b/lorie/src/main/AndroidManifest.xml
+@@ -4,6 +4,7 @@
+     android:installLocation="internalOnly">
+ 
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+     <uses-permission android:name="android.permission.INTERNET" />
+     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" tools:ignore="ProtectedPermissions" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+@@ -64,16 +65,35 @@
+ 
+         <receiver android:name=".LoriePreferences$Receiver" android:exported="true" tools:ignore="ExportedReceiver" android:enabled="true">
+             <intent-filter>
+-                <action android:name="com.termux.x11.CHANGE_PREFERENCE" />
++                <action android:name="com.steamruntime.dev.CHANGE_PREFERENCE" />
+             </intent-filter>
+         </receiver>
+ 
+         <receiver android:name=".LorieApp$Receiver" android:exported="true" tools:ignore="ExportedReceiver" android:enabled="true">
+             <intent-filter>
++                <action android:name="com.steamruntime.dev.CmdEntryPoint.ACTION_START" />
+                 <action android:name="com.termux.x11.CmdEntryPoint.ACTION_START" />
+-                <action android:name="com.termux.x11.ACTION_STOP" />
+-                <action android:name="com.termux.x11.ACTION_PREFERENCES_CHANGED" />
+-                <action android:name="com.termux.x11.ACTION_CUSTOM" />
++                <action android:name="com.steamruntime.dev.ACTION_STOP" />
++                <action android:name="com.steamruntime.dev.ACTION_PREFERENCES_CHANGED" />
++                <action android:name="com.steamruntime.dev.ACTION_CUSTOM" />
++            </intent-filter>
++        </receiver>
++
++        <service
++            android:name=".SteamRuntimeService"
++            android:exported="true"
++            android:stopWithTask="false"
++            android:foregroundServiceType="specialUse">
++            <property
++                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
++                android:value="Steam Runtime Linux Compatibility Layer" />
++        </service>
++
++        <receiver
++            android:name=".SteamRuntimeReceiver"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="com.steamruntime.dev.CMD" />
+             </intent-filter>
+         </receiver>
+     </application>
+diff --git a/lorie/src/main/cpp/lorie/InitOutput.c b/lorie/src/main/cpp/lorie/InitOutput.c
+index ed41d5e..dd66dd6 100644
+--- a/lorie/src/main/cpp/lorie/InitOutput.c
++++ b/lorie/src/main/cpp/lorie/InitOutput.c
+@@ -160,7 +160,7 @@ void OsVendorInit(void) {
+     pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE);
+     pthread_mutex_init(&lorieScreen.state->lock, &mutex_attr);
+     pthread_mutex_init(&lorieScreen.state->cursor.lock, &mutex_attr);
+-    lorieScreen.state->cursor.visible = TRUE;
++    lorieScreen.state->cursor.visible = EnableCursor;
+ 
+     lorieListenForKnocks();
+ }
+@@ -286,8 +286,9 @@ Bool drawSquares() {
+ }
+ 
+ void ddxReady(void) {
+-    CursorVisible = TRUE;
+-    pScreenPtr->DisplayCursor(lorieMouse, pScreenPtr, rootCursor);
++    CursorVisible = EnableCursor;
++    if (EnableCursor)
++        pScreenPtr->DisplayCursor(lorieMouse, pScreenPtr, rootCursor);
+     if (NoListenAll)
+         return;
+     if (!xstartupArgv) {
+@@ -414,7 +415,7 @@ static Bool lorieCursorFromMouse(DeviceIntPtr pDev) {
+ }
+ 
+ void lorieSetCursorVisible(Bool visible) {
+-    pvfb->state->cursor.visible = visible;
++    pvfb->state->cursor.visible = EnableCursor && visible;
+     pvfb->state->cursor.moved = TRUE;
+     pthread_cond_signal(rendererCond);
+ }
+diff --git a/lorie/src/main/cpp/lorie/activity.cpp b/lorie/src/main/cpp/lorie/activity.cpp
+index ef13b0f..0ebf3c6 100644
+--- a/lorie/src/main/cpp/lorie/activity.cpp
++++ b/lorie/src/main/cpp/lorie/activity.cpp
+@@ -373,7 +373,7 @@ extern char* __progname;
+ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, __unused void *reserved) {
+     JNIEnv* env;
+ 
+-    if (!strcmp(__progname, "com.termux.x11")) {
++    if (!strcmp(__progname, "com.steamruntime.dev") || !strcmp(__progname, "com.termux.x11")) {
+         // Redirects stderr to logcat.
+         pthread_create([]{ static pthread_t t; return &t; }(), nullptr, +[](__unused void* cookie) -> void* {
+             FILE *fp;
+diff --git a/lorie/src/main/java/com/termux/x11/CmdEntryPoint.java b/lorie/src/main/java/com/termux/x11/CmdEntryPoint.java
+index 692c01b..05fa89e 100644
+--- a/lorie/src/main/java/com/termux/x11/CmdEntryPoint.java
++++ b/lorie/src/main/java/com/termux/x11/CmdEntryPoint.java
+@@ -5,6 +5,7 @@ import static android.system.Os.getuid;
+ import android.annotation.SuppressLint;
+ import android.app.IActivityManager;
+ import android.app.PendingIntent;
++import android.content.ComponentName;
+ import android.content.Context;
+ import android.content.IIntentReceiver;
+ import android.content.IIntentSender;
+@@ -30,7 +31,7 @@ import java.net.URL;
+ 
+ @Keep @SuppressLint({"StaticFieldLeak", "UnsafeDynamicallyLoadedCode"})
+ public class CmdEntryPoint extends ICmdEntryInterface.Stub {
+-    public static final String ACTION_START = "com.termux.x11.CmdEntryPoint.ACTION_START";
++    public static final String ACTION_START = "com.steamruntime.dev.CmdEntryPoint.ACTION_START";
+     static final Handler handler;
+     public static Context ctx;
+     private final Intent intent = createIntent();
+@@ -62,11 +63,17 @@ public class CmdEntryPoint extends ICmdEntryInterface.Stub {
+ 
+         Intent intent = new Intent(ACTION_START);
+         intent.putExtra(null, bundle);
+-        intent.setPackage(BuildConfig.APPLICATION_ID);
++        String pkg = System.getenv("PACKAGE_NAME");
++        if (pkg == null || pkg.isEmpty()) {
++            pkg = "com.steamruntime.dev";
++        }
++        intent.setPackage(pkg);
++        intent.setClassName(pkg, "com.termux.x11.LorieApp$Receiver");
+ 
+         if (getuid() == 0 || getuid() == 2000)
+             intent.setFlags(0x00400000 /* FLAG_RECEIVER_FROM_SHELL */);
+ 
++        Log.d("LorieConnect", "CmdEntryPoint: created intent action=" + ACTION_START + " pkg=" + pkg + " comp=" + intent.getComponent());
+         return intent;
+     }
+ 
+@@ -85,48 +92,54 @@ public class CmdEntryPoint extends ICmdEntryInterface.Stub {
+     }
+ 
+     static void sendBroadcast(Intent intent) {
+-        try {
+-            ctx.sendBroadcast(intent);
+-        } catch (Exception e) {
+-            if (e instanceof NullPointerException && ctx == null)
+-                Log.i("Broadcast", "Context is null, falling back to manual broadcasting");
+-            else
+-                Log.e("Broadcast", "Falling back to manual broadcasting, failed to broadcast intent through Context:", e);
+-
+-            String packageName;
++        Log.d("LorieConnect", "CmdEntryPoint.sendBroadcast: action=" + intent.getAction() + " target=" + intent.getComponent());
++        boolean sent = false;
++        if (ctx != null) {
+             try {
+-                packageName = android.app.ActivityThread.getPackageManager().getPackagesForUid(getuid())[0];
+-            } catch (RemoteException ex) {
+-                throw new RuntimeException(ex);
++                ctx.sendBroadcast(intent);
++                Log.d("LorieConnect", "CmdEntryPoint: ctx.sendBroadcast completed successfully");
++                sent = true;
++            } catch (Throwable e) {
++                Log.e("LorieConnect", "CmdEntryPoint: ctx.sendBroadcast threw: " + e.getMessage(), e);
++            }
++        } else {
++            Log.w("LorieConnect", "CmdEntryPoint: ctx is null");
++        }
++
++        if (!sent) {
++            Log.i("LorieConnect", "CmdEntryPoint: falling back to manual broadcasting");
++            String packageName = System.getenv("PACKAGE_NAME");
++            if (packageName == null || packageName.isEmpty()) {
++                packageName = "com.steamruntime.dev";
+             }
+-            IActivityManager am;
+             try {
+-                //noinspection JavaReflectionMemberAccess
+-                am = (IActivityManager) android.app.ActivityManager.class
+-                        .getMethod("getService")
+-                        .invoke(null);
+-            } catch (Exception e2) {
++                IActivityManager am = null;
+                 try {
+-                    am = (IActivityManager) Class.forName("android.app.ActivityManagerNative")
+-                            .getMethod("getDefault")
++                    am = (IActivityManager) android.app.ActivityManager.class
++                            .getMethod("getService")
+                             .invoke(null);
+-                } catch (Exception e3) {
+-                    throw new RuntimeException(e3);
++                } catch (Throwable e2) {
++                    try {
++                        am = (IActivityManager) Class.forName("android.app.ActivityManagerNative")
++                                .getMethod("getDefault")
++                                .invoke(null);
++                    } catch (Throwable e3) {
++                        Log.e("LorieConnect", "CmdEntryPoint: failed to get ActivityManager: " + e3.getMessage());
++                    }
+                 }
+-            }
+ 
+-            assert am != null;
+-            IIntentSender sender = am.getIntentSender(1, packageName, null, null, 0, new Intent[] { intent },
+-                    null, PendingIntent.FLAG_CANCEL_CURRENT | PendingIntent.FLAG_ONE_SHOT, null, 0);
+-            try {
+-                //noinspection JavaReflectionMemberAccess
+-                IIntentSender.class
+-                        .getMethod("send", int.class, Intent.class, String.class, IBinder.class, IIntentReceiver.class, String.class, Bundle.class)
+-                        .invoke(sender, 0, intent, null, null, new IIntentReceiver.Stub() {
+-                            @Override public void performReceive(Intent i, int r, String d, Bundle e, boolean o, boolean s, int a) {}
+-                        }, null, null);
+-            } catch (Exception ex) {
+-                throw new RuntimeException(ex);
++                if (am != null) {
++                    IIntentSender sender = am.getIntentSender(1, packageName, null, null, 0, new Intent[] { intent },
++                            null, PendingIntent.FLAG_CANCEL_CURRENT | PendingIntent.FLAG_ONE_SHOT, null, 0);
++                    IIntentSender.class
++                            .getMethod("send", int.class, Intent.class, String.class, IBinder.class, IIntentReceiver.class, String.class, Bundle.class)
++                            .invoke(sender, 0, intent, null, null, new IIntentReceiver.Stub() {
++                                @Override public void performReceive(Intent i, int r, String d, Bundle e, boolean o, boolean s, int a) {}
++                            }, null, null);
++                    Log.d("LorieConnect", "CmdEntryPoint: manual broadcast via am.getIntentSender succeeded");
++                }
++            } catch (Throwable ex) {
++                Log.e("LorieConnect", "CmdEntryPoint: manual broadcast failed: " + ex.getMessage(), ex);
+             }
+         }
+     }
+@@ -152,14 +165,17 @@ public class CmdEntryPoint extends ICmdEntryInterface.Stub {
+             // Hiding harmless framework errors, like this:
+             // java.io.FileNotFoundException: /data/system/theme_config/theme_compatibility.xml: open failed: ENOENT (No such file or directory)
+             System.setErr(new PrintStream(new OutputStream() { public void write(int arg0) {} }));
+-            if (System.getenv("OLD_CONTEXT") != null) {
++            try {
+                 context = android.app.ActivityThread.systemMain().getSystemContext();
+-            } else {
++                Log.d("LorieConnect", "createContext: systemMain succeeded, context=" + context);
++            } catch (Throwable t) {
++                Log.w("LorieConnect", "createContext: systemMain failed (" + t.getMessage() + "), trying allocateInstance");
+                 context = ((android.app.ActivityThread) Class.
+                         forName("sun.misc.Unsafe").
+                         getMethod("allocateInstance", Class.class).
+                         invoke(unsafe, android.app.ActivityThread.class))
+                         .getSystemContext();
++                Log.d("LorieConnect", "createContext: allocateInstance succeeded, context=" + context);
+             }
+         } catch (Exception e) {
+             Log.e("Context", "Failed to instantiate context:", e);
+@@ -189,6 +205,7 @@ public class CmdEntryPoint extends ICmdEntryInterface.Stub {
+     private static void initEntryPoint() {
+         ctx = createContext();
+ 
++        boolean loaded = false;
+         String path = "lib/" + Build.SUPPORTED_ABIS[0] + "/libXlorie.so";
+         ClassLoader loader = CmdEntryPoint.class.getClassLoader();
+         URL res = loader != null ? loader.getResource(path) : null;
+@@ -196,11 +213,32 @@ public class CmdEntryPoint extends ICmdEntryInterface.Stub {
+         if (libPath != null) {
+             try {
+                 System.load(libPath);
+-            } catch (Exception e) {
+-                Log.e("CmdEntryPoint", "Failed to dlopen " + libPath, e);
+-                System.err.println("Failed to load native library. Did you install the right apk? Try the universal one.");
+-                System.exit(134);
++                loaded = true;
++            } catch (Throwable e) {
++                Log.w("CmdEntryPoint", "Failed to dlopen " + libPath + ": " + e.getMessage());
++            }
++        }
++        if (!loaded && ctx != null) {
++            try {
++                String appLib = ctx.getApplicationInfo().nativeLibraryDir + "/libXlorie.so";
++                System.load(appLib);
++                loaded = true;
++            } catch (Throwable e) {
++                Log.w("CmdEntryPoint", "Failed to load from nativeLibraryDir: " + e.getMessage());
+             }
+         }
++        if (!loaded) {
++            try {
++                System.loadLibrary("Xlorie");
++                loaded = true;
++            } catch (Throwable e) {
++                Log.w("CmdEntryPoint", "Failed to loadLibrary Xlorie: " + e.getMessage());
++            }
++        }
++        if (!loaded) {
++            Log.e("CmdEntryPoint", "Failed to load libXlorie.so from all locations");
++            System.err.println("Failed to load native library. Did you install the right apk? Try the universal one.");
++            System.exit(134);
++        }
+     }
+ }
+diff --git a/lorie/src/main/java/com/termux/x11/LorieApp.java b/lorie/src/main/java/com/termux/x11/LorieApp.java
+index c94db16..3e0c94f 100644
+--- a/lorie/src/main/java/com/termux/x11/LorieApp.java
++++ b/lorie/src/main/java/com/termux/x11/LorieApp.java
+@@ -35,6 +35,8 @@ public class LorieApp extends Application {
+ 
+     public final Prefs builtInPrefs = new Prefs();
+     public final Prefs secondaryPrefs = new Prefs();
++    private static LorieApp sInstance;
++
+     public NotificationManager notificationManager;
+     public IBinder pendingConnection;
+ 
+@@ -50,14 +52,34 @@ public class LorieApp extends Application {
+     @SuppressLint("ObsoleteSdkInt")
+     public void onCreate() {
+         super.onCreate();
++        sInstance = this;
+ 
+         // A platform-supplied Context can identify as the host app's package in sharedUid builds.
+         Context prefsCtx = this;
+-        if (!BuildConfig.APPLICATION_ID.equals(getPackageName())) {
++        if (!BuildConfig.APPLICATION_ID.equals(getPackageName()) && !"com.steamruntime.dev".equals(getPackageName())) {
+             try {
+                 prefsCtx = createPackageContext(BuildConfig.APPLICATION_ID, 0);
+             } catch (PackageManager.NameNotFoundException e) {
+-                throw new RuntimeException(e);
++                prefsCtx = this;
++            }
++        }
++
++        if ("com.steamruntime.dev".equals(getPackageName())) {
++            SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(prefsCtx);
++            if (!sp.getBoolean("handheld_defaults_applied", false)) {
++                sp.edit()
++                        .putString("touchMode", "3")
++                        .putBoolean("fullscreen", true)
++                        .putBoolean("hideCutout", true)
++                        .putBoolean("showAdditionalKbd", false)
++                        .putBoolean("additionalKbdVisible", false)
++                        .putString("forceOrientation", "landscape")
++                        .putString("screenIdleTimeout", "never")
++                        .putString("displayResolutionMode", "scaled")
++                        .putInt("displayScale", 200)
++                        .putString("displayFilteringMode", "bilinear")
++                        .putBoolean("handheld_defaults_applied", true)
++                        .commit();
+             }
+         }
+ 
+@@ -92,6 +114,10 @@ public class LorieApp extends Application {
+                 .build();
+     }
+ 
++    public static LorieApp get() {
++        return sInstance;
++    }
++
+     /** Picks builtInPrefs or secondaryPrefs depending on which display ctx's window is on. */
+     public Prefs getPrefs(Context ctx) {
+         boolean isSecondaryDisplay = ((WindowManager) ctx.getSystemService(WINDOW_SERVICE))
+@@ -101,7 +127,8 @@ public class LorieApp extends Application {
+     }
+ 
+     public void onActivityResumed(MainActivity activity) {
+-        notificationManager.notify(NOTIFICATION_ID, buildNotification(activity));
++        // Steam Services Host: the service already shows a foreground notification
++        // notificationManager.notify(NOTIFICATION_ID, buildNotification(activity));
+     }
+ 
+     public void onActivityPaused() {
+@@ -114,7 +141,8 @@ public class LorieApp extends Application {
+             return;
+         for (StatusBarNotification notification : notificationManager.getActiveNotifications())
+             if (notification.getId() == NOTIFICATION_ID) {
+-                notificationManager.notify(NOTIFICATION_ID, buildNotification(activity));
++                // Steam Services Host: the service already shows a foreground notification
++                // notificationManager.notify(NOTIFICATION_ID, buildNotification(activity));
+                 return;
+             }
+     }
+@@ -127,11 +155,13 @@ public class LorieApp extends Application {
+     public void onBroadcastReceive(Intent intent) {
+         MainActivity activity = MainActivity.getInstance();
+         String action = intent.getAction();
++        Log.d("LorieConnect", "LorieApp.onBroadcastReceive: action=" + action + ", activity=" + (activity != null));
+         if (activity != null)
+             activity.prefs = getPrefs(activity);
+ 
+         switch (action == null ? "" : action) {
+-            case ACTION_START: {
++            case ACTION_START:
++            case "com.termux.x11.CmdEntryPoint.ACTION_START": {
+                 Bundle bundle = intent.getBundleExtra(null);
+                 IBinder binder = bundle == null ? null : bundle.getBinder(null);
+                 if (binder == null)
+@@ -157,21 +187,23 @@ public class LorieApp extends Application {
+                     }
+                 } catch (RemoteException ignored) {}
+ 
++                Log.d("LorieConnect", "LorieApp.onBroadcastReceive: extracted binder=" + binder);
+                 if (activity != null) {
+                     try {
+-                        Log.v("LorieApp", "Got new ACTION_START intent");
++                        Log.d("LorieConnect", "LorieApp: passing binder to MainActivity.connectToService");
+                         activity.connectToService(binder);
+                     } catch (Exception e) {
+-                        Log.e("LorieApp", "Something went wrong while we extracted connection details from binder.", e);
++                        Log.e("LorieConnect", "LorieApp: error in connectToService: " + e.getMessage(), e);
+                     }
+                 } else {
++                    Log.d("LorieConnect", "LorieApp: activity is null, caching in pendingConnection");
+                     pendingConnection = binder;
+                 }
+                 break;
+             }
+             case MainActivity.ACTION_STOP:
+                 if (activity != null)
+-                    activity.finishAffinity();
++                    try { activity.finishAndRemoveTask(); } catch (Throwable t) { activity.finishAffinity(); }
+                 break;
+             case ACTION_PREFERENCES_CHANGED:
+                 if (activity != null)
+@@ -184,7 +216,7 @@ public class LorieApp extends Application {
+                 break;
+         }
+ 
+-        if (activity == null && !ACTION_START.equals(action))
++        if (activity == null && !ACTION_START.equals(action) && !"com.steamruntime.dev.CmdEntryPoint.ACTION_START".equals(action) && !"com.termux.x11.CmdEntryPoint.ACTION_START".equals(action))
+             Log.w("LorieApp", "Got " + action + " but no MainActivity instance in this process");
+     }
+ 
+@@ -200,6 +232,7 @@ public class LorieApp extends Application {
+     public static class Receiver extends BroadcastReceiver {
+         @Override
+         public void onReceive(Context context, Intent intent) {
++            Log.d("LorieConnect", "LorieApp$Receiver.onReceive: received action=" + intent.getAction());
+             ((LorieApp) context.getApplicationContext()).onBroadcastReceive(intent);
+         }
+     }
+diff --git a/lorie/src/main/java/com/termux/x11/LoriePreferences.java b/lorie/src/main/java/com/termux/x11/LoriePreferences.java
+index f4cbaf0..c38ce84 100644
+--- a/lorie/src/main/java/com/termux/x11/LoriePreferences.java
++++ b/lorie/src/main/java/com/termux/x11/LoriePreferences.java
+@@ -81,9 +81,17 @@ import java.util.regex.PatternSyntaxException;
+ 
+ @SuppressWarnings("deprecation")
+ public class LoriePreferences extends AppCompatActivity implements PreferenceFragmentCompat.OnPreferenceStartFragmentCallback {
+-    static final String ACTION_PREFERENCES_CHANGED = "com.termux.x11.ACTION_PREFERENCES_CHANGED";
++    static final String ACTION_PREFERENCES_CHANGED = "com.steamruntime.dev.ACTION_PREFERENCES_CHANGED";
+     private Prefs prefs;
+ 
++    /** Resolves the LorieApp instance from a context, falling back to the app-wide singleton. */
++    private static LorieApp lorieApp(Context ctx) {
++        Context appCtx = ctx.getApplicationContext();
++        if (appCtx instanceof LorieApp)
++            return (LorieApp) appCtx;
++        return LorieApp.get();
++    }
++
+     private final BroadcastReceiver receiver = new BroadcastReceiver() {
+         @SuppressLint("UnspecifiedRegisterReceiverFlag")
+         @Override
+@@ -579,7 +587,7 @@ public class LoriePreferences extends AppCompatActivity implements PreferenceFra
+             try {
+                 if (intent != null && intent.getExtras() != null) {
+                     Context targetCtx = MainActivity.getInstance() != null ? MainActivity.getInstance() : context;
+-                    Prefs p = ((LorieApp) context.getApplicationContext()).getPrefs(targetCtx);
++                    Prefs p = lorieApp(context).getPrefs(targetCtx);
+                     if (intent.getStringExtra("list") != null) {
+                         String result = "";
+                         for (PrefsProto.Preference pref : p.keys.values()) {
+@@ -635,7 +643,7 @@ public class LoriePreferences extends AppCompatActivity implements PreferenceFra
+                                     sendResponse(remote, 1, 1, "Permission denied.\n" +
+                                             "Android requires WRITE_SECURE_SETTINGS permission to change `enableAccessibilityServiceAutomatically` setting.\n" +
+                                             "Please, launch this command using ADB:\n" +
+-                                            "adb shell pm grant com.termux.x11 android.permission.WRITE_SECURE_SETTINGS");
++                                            "adb shell pm grant com.steamruntime.dev android.permission.WRITE_SECURE_SETTINGS");
+                                     return;
+                                 }
+ 
+@@ -648,7 +656,7 @@ public class LoriePreferences extends AppCompatActivity implements PreferenceFra
+                             }
+                             case "storeSecondaryDisplayPreferencesSeparately": {
+                                 // Always canonical, regardless of which display targetCtx resolved to.
+-                                ((LorieApp) context.getApplicationContext()).builtInPrefs.preferences.edit()
++                                lorieApp(context).builtInPrefs.preferences.edit()
+                                         .putBoolean(key, "true".contentEquals(newValue)).commit();
+                                 break;
+                             }
+@@ -736,13 +744,17 @@ public class LoriePreferences extends AppCompatActivity implements PreferenceFra
+             android.util.Log.i("LoriePreferences$Receiver", "commit " + BuildConfig.COMMIT);
+             //noinspection resource
+             ParcelFileDescriptor in = ParcelFileDescriptor.adoptFd(0);
+-            Intent i = new Intent("com.termux.x11.CHANGE_PREFERENCE");
++            Intent i = new Intent("com.steamruntime.dev.CHANGE_PREFERENCE");
+             Bundle bundle = new Bundle();
+             boolean inputIsFile = !android.system.Os.isatty(in.getFileDescriptor());
+ 
+             in.detachFd();
+             bundle.putBinder(null, iface);
+-            i.setPackage(BuildConfig.APPLICATION_ID);
++            String prefPkg = System.getenv("PACKAGE_NAME");
++            if (prefPkg == null || prefPkg.isEmpty()) {
++                prefPkg = "com.steamruntime.dev";
++            }
++            i.setPackage(prefPkg);
+             i.putExtra(null, bundle);
+             if (getuid() == 0 || getuid() == 2000)
+                 i.setFlags(0x00400000 /* FLAG_RECEIVER_FROM_SHELL */);
+@@ -828,14 +840,14 @@ public class LoriePreferences extends AppCompatActivity implements PreferenceFra
+             public boolean get() {
+                 checkAttached();
+                 if (isSharedAcrossDisplays(key))
+-                    return ((LorieApp) ctx.getApplicationContext()).builtInPrefs.preferences.getBoolean(key, (boolean) defValue);
++                    return lorieApp(ctx).builtInPrefs.preferences.getBoolean(key, (boolean) defValue);
+                 return preferences.getBoolean(key, (boolean) defValue);
+             }
+ 
+             public void put(boolean v) {
+                 checkAttached();
+                 if (isSharedAcrossDisplays(key))
+-                    ((LorieApp) ctx.getApplicationContext()).builtInPrefs.preferences.edit().putBoolean(key, v).commit();
++                    lorieApp(ctx).builtInPrefs.preferences.edit().putBoolean(key, v).commit();
+                 preferences.edit().putBoolean(key, v).commit();
+             }
+         }
+@@ -945,14 +957,14 @@ public class LoriePreferences extends AppCompatActivity implements PreferenceFra
+         @Override public void putBoolean(String k, boolean v) {
+             checkAttached();
+             if (isSharedAcrossDisplays(k))
+-                ((LorieApp) ctx.getApplicationContext()).builtInPrefs.preferences.edit().putBoolean(k, v).commit();
++                lorieApp(ctx).builtInPrefs.preferences.edit().putBoolean(k, v).commit();
+             else
+                 preferences.edit().putBoolean(k, v).commit();
+         }
+         @Override public boolean getBoolean(String k, boolean d) {
+             checkAttached();
+             if (isSharedAcrossDisplays(k))
+-                return ((LorieApp) ctx.getApplicationContext()).builtInPrefs.preferences.getBoolean(k, d);
++                return lorieApp(ctx).builtInPrefs.preferences.getBoolean(k, d);
+             return preferences.getBoolean(k, d);
+         }
+         @Override public void putString(String k, @Nullable String v) { get().edit().putString(k, v).commit(); }
+diff --git a/lorie/src/main/java/com/termux/x11/MainActivity.java b/lorie/src/main/java/com/termux/x11/MainActivity.java
+index 5d60a7c..bbf5545 100644
+--- a/lorie/src/main/java/com/termux/x11/MainActivity.java
++++ b/lorie/src/main/java/com/termux/x11/MainActivity.java
+@@ -79,8 +79,8 @@ import java.util.Objects;
+ @Keep @SuppressLint("ApplySharedPref")
+ @SuppressWarnings({"deprecation", "unused"})
+ public class MainActivity extends AppCompatActivity {
+-    public static final String ACTION_STOP = "com.termux.x11.ACTION_STOP";
+-    public static final String ACTION_CUSTOM = "com.termux.x11.ACTION_CUSTOM";
++    public static final String ACTION_STOP = "com.steamruntime.dev.ACTION_STOP";
++    public static final String ACTION_CUSTOM = "com.steamruntime.dev.ACTION_CUSTOM";
+ 
+     public static Handler handler = new Handler();
+     private final Runnable connectRetry = this::tryConnect;
+@@ -147,10 +147,31 @@ public class MainActivity extends AppCompatActivity {
+         return null;
+     }
+ 
++    @Override
++    protected void onNewIntent(Intent intent) {
++        super.onNewIntent(intent);
++        setIntent(intent);
++        handleIntent(intent);
++    }
++
++    private void handleIntent(Intent intent) {
++        if (intent != null && intent.getBooleanExtra("RESTART_STEAM", false)) {
++            Intent sIntent = new Intent(this, SteamRuntimeService.class);
++            sIntent.setAction("START");
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++                startForegroundService(sIntent);
++            } else {
++                startService(sIntent);
++            }
++        }
++    }
++
+     @Override
+     @SuppressLint({"AppCompatMethod", "ObsoleteSdkInt", "ClickableViewAccessibility", "WrongConstant", "UnspecifiedRegisterReceiverFlag"})
+     protected void onCreate(Bundle savedInstanceState) {
+         super.onCreate(savedInstanceState);
++        instance = this;
++        handleIntent(getIntent());
+ 
+         app = (LorieApp) getApplication();
+         prefs = app.getPrefs(this);
+@@ -170,6 +191,36 @@ public class MainActivity extends AppCompatActivity {
+         findViewById(R.id.help_button).setOnClickListener((l) -> startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/termux/termux-x11/blob/master/README.md#running-graphical-applications"))));
+         findViewById(R.id.exit_button).setOnClickListener((l) -> finish());
+ 
++                // Autostart SteamRuntimeService
++        Intent autoStartIntent = new Intent(this, SteamRuntimeService.class);
++        autoStartIntent.setAction("START");
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++            startForegroundService(autoStartIntent);
++        } else {
++            startService(autoStartIntent);
++        }
++
++        View btnStart = findViewById(R.id.btn_start_runtime);
++        if (btnStart != null) {
++            btnStart.setOnClickListener((v) -> {
++                Intent sIntent = new Intent(this, SteamRuntimeService.class);
++                sIntent.setAction("START");
++                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++                    startForegroundService(sIntent);
++                } else {
++                    startService(sIntent);
++                }
++            });
++        }
++        View btnStop = findViewById(R.id.btn_stop_runtime);
++        if (btnStop != null) {
++            btnStop.setOnClickListener((v) -> {
++                Intent sIntent = new Intent(this, SteamRuntimeService.class);
++                sIntent.setAction("STOP");
++                startService(sIntent);
++            });
++        }
++
+         LorieView lorieView = findViewById(R.id.lorieView);
+         View lorieParent = (View) lorieView.getParent();
+ 
+@@ -245,8 +296,7 @@ public class MainActivity extends AppCompatActivity {
+         initMouseAuxButtons();
+ 
+         if (SDK_INT >= VERSION_CODES.TIRAMISU
+-                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PERMISSION_GRANTED
+-                && !shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)) {
++                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PERMISSION_GRANTED) {
+             requestPermissions(new String[] { Manifest.permission.POST_NOTIFICATIONS }, 0);
+         }
+ 
+@@ -537,6 +587,7 @@ public class MainActivity extends AppCompatActivity {
+     }
+ 
+     void connectToService(IBinder ibinder) {
++        Log.d("LorieConnect", "MainActivity.connectToService called with binder=" + ibinder);
+         service = ICmdEntryInterface.Stub.asInterface(ibinder);
+         try {
+             if (service != null && service.asBinder().isBinderAlive()) {
+@@ -566,7 +617,9 @@ public class MainActivity extends AppCompatActivity {
+         }
+ 
+         if (service == null) {
++            Log.d("LorieConnect", "MainActivity.tryConnect: service is null, knocking on port 7892");
+             boolean sent = getLorieView().requestConnection();
++            Log.d("LorieConnect", "MainActivity.tryConnect: requestConnection sent=" + sent);
+             scheduleConnect();
+             return true;
+         }
+@@ -574,16 +627,18 @@ public class MainActivity extends AppCompatActivity {
+         try {
+             ParcelFileDescriptor fd = service.getXConnection();
+             if (fd != null) {
+-                Log.v("MainActivity", "Extracting X connection socket.");
++                Log.d("LorieConnect", "MainActivity: X connection established successfully (fd=" + fd.getFd() + ")");
+                 getLorieView().connect(fd.detachFd());
+                 finishStartupDraw();
+                 getLorieView().triggerCallback();
+                 clientConnectedStateChanged();
+                 getLorieView().reloadPreferences(prefs);
+-            } else
++            } else {
++                Log.d("LorieConnect", "MainActivity.tryConnect: getXConnection returned null");
+                 scheduleConnect();
++            }
+         } catch (Exception e) {
+-            Log.e("MainActivity", "Something went wrong while we were establishing connection", e);
++            Log.e("LorieConnect", "MainActivity.tryConnect error: " + e.getMessage(), e);
+             service = null;
+ 
+             scheduleConnect();
+@@ -606,6 +661,9 @@ public class MainActivity extends AppCompatActivity {
+ 
+     @SuppressLint("UnsafeIntentLaunch")
+     void onPreferencesChangedCallback() {
++        if (isFinishing() || isDestroyed())
++            return;
++
+         prefs = app.getPrefs(this);
+ 
+         // There is no way back to the normal size from picture-in-picture, so the window is closed.
+@@ -650,6 +708,14 @@ public class MainActivity extends AppCompatActivity {
+     @Override
+     public void onResume() {
+         super.onResume();
++        instance = this;
++
++        if (app != null && app.pendingConnection != null) {
++            connectToService(app.pendingConnection);
++            app.pendingConnection = null;
++        } else if (!getLorieView().connected()) {
++            tryConnect();
++        }
+ 
+         app.onActivityResumed(this);
+ 
+@@ -942,7 +1008,8 @@ public class MainActivity extends AppCompatActivity {
+         int requestedOrientation;
+         switch (isInMultiWindowMode() ? "auto" : prefs.forceOrientation.get()) {
+             case "portrait": requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT; break;
+-            case "landscape": requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE; break;
++            case "landscape":
++            case "sensorLandscape": requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE; break;
+             case "reverse portrait": requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT; break;
+             case "reverse landscape": requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE; break;
+             default: requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
+@@ -974,6 +1041,9 @@ public class MainActivity extends AppCompatActivity {
+         }
+ 
+         setWindowFlag(FLAG_FULLSCREEN, fullscreen);
++        if ("never".equals(prefs.screenIdleTimeout.get()) || "com.steamruntime.dev".equals(getPackageName())) {
++            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
++        }
+         applyScreenIdleTimeout();
+         applyImmersiveMode();
+ 
+@@ -1059,6 +1129,7 @@ public class MainActivity extends AppCompatActivity {
+     void clientConnectedStateChanged() {
+         runOnUiThread(()-> {
+             boolean connected = getLorieView().connected();
++            Log.d("LorieConnect", "MainActivity.clientConnectedStateChanged: connected=" + connected);
+             if (!connected)
+                 setCapturingEnabled(false);
+ 
+@@ -1071,8 +1142,8 @@ public class MainActivity extends AppCompatActivity {
+ 
+             setTerminalToolbarView();
+             findViewById(R.id.mouse_buttons).setVisibility(prefs.showMouseHelper.get() && "1".equals(prefs.touchMode.get()) && connected ? View.VISIBLE : View.GONE);
+-            findViewById(R.id.stub).setVisibility(connected?View.INVISIBLE:View.VISIBLE);
+-            getLorieView().setVisibility(connected?View.VISIBLE:View.INVISIBLE);
++            findViewById(R.id.stub).setVisibility(connected ? View.GONE : View.VISIBLE);
++            getLorieView().setVisibility(connected ? View.VISIBLE : View.GONE);
+ 
+             // We should recover connection in the case if file descriptor for some reason was broken...
+             if (!connected)
+diff --git a/lorie/src/main/java/com/termux/x11/input/TouchInputHandler.java b/lorie/src/main/java/com/termux/x11/input/TouchInputHandler.java
+index e5598c0..d5d7f78 100644
+--- a/lorie/src/main/java/com/termux/x11/input/TouchInputHandler.java
++++ b/lorie/src/main/java/com/termux/x11/input/TouchInputHandler.java
+@@ -828,6 +828,11 @@ public class TouchInputHandler {
+          */
+         @Override
+         public void onTap(int pointerCount, float x, float y) {
++            if (pointerCount == 3) {
++                mActivity.toggleKeyboardVisibility();
++                return;
++            }
++
+             int button = mouseButtonFromPointerCount(pointerCount);
+             if (button == InputStub.BUTTON_UNDEFINED)
+                 return;
+diff --git a/lorie/src/main/java/com/termux/x11/utils/TermuxX11ExtraKeys.java b/lorie/src/main/java/com/termux/x11/utils/TermuxX11ExtraKeys.java
+index 89fcf8e..fd401e5 100644
+--- a/lorie/src/main/java/com/termux/x11/utils/TermuxX11ExtraKeys.java
++++ b/lorie/src/main/java/com/termux/x11/utils/TermuxX11ExtraKeys.java
+@@ -50,7 +50,7 @@ public class TermuxX11ExtraKeys implements ExtraKeysView.IExtraKeysView {
+     }
+ 
+     private final KeyCharacterMap mVirtualKeyboardKeyCharacterMap = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD);
+-    static final String ACTION_START_PREFERENCES_ACTIVITY = "com.termux.x11.start_preferences_activity";
++    static final String ACTION_START_PREFERENCES_ACTIVITY = "com.steamruntime.dev.start_preferences_activity";
+ 
+     @Override
+     public void onExtraKeyButtonClick(View view, ExtraKeyButton buttonInfo, Button button) {
+diff --git a/lorie/src/main/res/layout/main_activity.xml b/lorie/src/main/res/layout/main_activity.xml
+index ddd568f..a88aef5 100644
+--- a/lorie/src/main/res/layout/main_activity.xml
++++ b/lorie/src/main/res/layout/main_activity.xml
+@@ -105,6 +105,33 @@
+                     android:tint="?attr/colorControlNormal"
+                     android:contentDescription="@string/exit_button_text" />
+             </LinearLayout>
++
++            <LinearLayout
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:layout_marginTop="16dp"
++                android:orientation="horizontal">
++
++                <Button
++                    android:id="@+id/btn_start_runtime"
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:text="Start Runtime"
++                    android:textColor="#FFFFFF"
++                    tools:ignore="HardcodedText" />
++
++                <Space
++                    android:layout_width="8dp"
++                    android:layout_height="wrap_content" />
++
++                <Button
++                    android:id="@+id/btn_stop_runtime"
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:text="Stop Runtime"
++                    android:textColor="#FFFFFF"
++                    tools:ignore="HardcodedText" />
++            </LinearLayout>
+         </LinearLayout>
+ 
+ 
+diff --git a/lorie/src/main/res/values/strings.xml b/lorie/src/main/res/values/strings.xml
+index b0258de..b5afb2b 100644
+--- a/lorie/src/main/res/values/strings.xml
++++ b/lorie/src/main/res/values/strings.xml
+@@ -1,7 +1,7 @@
+ <!DOCTYPE resources [
+     <!ENTITY TERMUX_PACKAGE_NAME "com.termux">
+     <!ENTITY TERMUX_APP_NAME "Termux">
+-    <!ENTITY TERMUX_X11_APP_NAME "Termux:X11">
++    <!ENTITY TERMUX_X11_APP_NAME "Steam Runtime (dev)">
+     ]>
+ <resources>
+     <string name="lorie_app_name">&TERMUX_X11_APP_NAME;</string>
+diff --git a/shell-loader/build.gradle b/shell-loader/build.gradle
+index ceb580f..79a171c 100755
+--- a/shell-loader/build.gradle
++++ b/shell-loader/build.gradle
+@@ -27,7 +27,7 @@ def signingConfig = project(':lorie-app').android.signingConfigs.debug
+ def keyStore = java.security.KeyStore.getInstance(java.security.KeyStore.getDefaultType())
+ keyStore.load(new FileInputStream(signingConfig.storeFile), signingConfig.keyPassword.toCharArray())
+ 
+-ext.targetApplicationId = "com.termux.x11"
++ext.targetApplicationId = "com.steamruntime.dev"
+ ext.embeddedApplicationId = "com.termux"
+ 
+ android.defaultConfig.buildConfigField "String", "APPLICATION_ID", "\"$targetApplicationId\""
+diff --git a/shell-loader/scripts/termux-x11-preference.in b/shell-loader/scripts/termux-x11-preference.in
+index d5e9611..509f801 100755
+--- a/shell-loader/scripts/termux-x11-preference.in
++++ b/shell-loader/scripts/termux-x11-preference.in
+@@ -20,7 +20,7 @@ if [ "$(getprop ro.build.version.sdk)" -ge "34" ]; then
+   exec /system/bin/app_process -Xnoimage-dex2oat / com.termux.x11.Loader "$@"
+ fi
+ 
+-COMMAND=("am" "broadcast" "-a" "com.termux.x11.CHANGE_PREFERENCE" "-p" "@APPLICATION_ID@")
++COMMAND=("am" "broadcast" "-a" "com.steamruntime.dev.CHANGE_PREFERENCE" "-p" "@APPLICATION_ID@")
+ help() {
+   echo "$0 [list] {key:value} [{key2:value2}]..."
+   exit 1
