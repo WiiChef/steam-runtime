@@ -64,7 +64,7 @@ static uintptr_t GetModuleBase(const char* module_name) {
     return base;
 }
 
-static char s_steamInstallPath[256] = "/data/local/tmp";
+static char s_steamInstallPath[256] = "/data/user/0/com.steamruntime.dev/files";
 
 // Runtime patches to the locally supplied libsteamclient.so. The offsets and instruction words are
 // not part of this repo; they are read from a private steamclient_patches.conf (see patchconf.h).
@@ -89,7 +89,7 @@ uid_t geteuid(void) {
     return 0;
 }
 
-// Hook open & openat to redirect Valve IPC shared memory to /data/user/0/com.steamruntime.dev/files/ipc/u0-ValveIPCSharedObj-Steam (fallback /data/local/tmp)
+// Hook open & openat to redirect Valve IPC shared memory to the shared-UID host files directory.
 int open(const char* pathname, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) {
@@ -102,8 +102,7 @@ int open(const char* pathname, int flags, ...) {
     const char* real_path = pathname;
     if (pathname && strstr(pathname, "ValveIPCSharedObj-Steam") != NULL) {
         static const char new_path[] = "/data/user/0/com.steamruntime.dev/files/ipc/u0-ValveIPCSharedObj-Steam";
-        static const char old_path[] = "/data/local/tmp/u0-ValveIPCSharedObj-Steam";
-        real_path = (access(new_path, 0) != 0) ? old_path : new_path;
+        real_path = new_path;
         LOGI("[HOOK] open('%s') redirected -> '%s'", pathname, real_path);
     }
 
@@ -128,8 +127,7 @@ int openat(int dirfd, const char* pathname, int flags, ...) {
     const char* real_path = pathname;
     if (pathname && strstr(pathname, "ValveIPCSharedObj-Steam") != NULL) {
         static const char new_path[] = "/data/user/0/com.steamruntime.dev/files/ipc/u0-ValveIPCSharedObj-Steam";
-        static const char old_path[] = "/data/local/tmp/u0-ValveIPCSharedObj-Steam";
-        real_path = (access(new_path, 0) != 0) ? old_path : new_path;
+        real_path = new_path;
         LOGI("[HOOK] openat('%s') redirected -> '%s'", pathname, real_path);
     }
 
@@ -162,8 +160,7 @@ int __system_property_get(const char *name, char *value) {
 int shm_open(const char *name, int oflag, mode_t mode) {
     if (name && strstr(name, "ValveIPCSharedObj-Steam") != NULL) {
         static const char new_path[] = "/data/user/0/com.steamruntime.dev/files/ipc/u0-ValveIPCSharedObj-Steam";
-        static const char old_path[] = "/data/local/tmp/u0-ValveIPCSharedObj-Steam";
-        const char *mirror = (access(new_path, 0) != 0) ? old_path : new_path;
+        const char *mirror = new_path;
         LOGI("shm_open('%s') -> mirror '%s'", name, mirror);
         int fd = open(mirror, O_RDONLY);
         if (fd >= 0) {

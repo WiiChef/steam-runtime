@@ -5,8 +5,7 @@
 // private file that you create yourself (see docs/PATCH_CONF.md for the format). Without that file the
 // shim still loads and forwards calls, but performs no patching and will not attach to the host.
 //
-// File search order: $STEAM_PATCH_CONF, <host files dir>/steamclient_patches.conf,
-// /data/local/tmp/steamclient_patches.conf
+// File search order: $STEAM_PATCH_CONF, <host files dir>/steamclient_patches.conf.
 //
 // Line format ('#' starts a comment, numbers are hex, offsets are relative to the module base):
 //   u8  <off> <val>        write one byte
@@ -41,7 +40,6 @@ static void pc_load(void) {
     const char *cands[] = {
         env,
         "/data/user/0/com.steamruntime.dev/files/steamclient_patches.conf",
-        "/data/local/tmp/steamclient_patches.conf",
     };
     FILE *f = NULL;
     for (unsigned i = 0; i < sizeof(cands) / sizeof(cands[0]) && !f; i++)
