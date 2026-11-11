@@ -63,7 +63,10 @@ Two ways to get Valve's Linux ARM64 client (`/root/steamrtarm64`) into the rootf
    manifest has no arm64 blocks it logs `has no arm64 client package` with the block names and exits 4.
 
 `pinned_build_id` is published as `"pinned_build_id"` in `files/status.json`. Log: `files/tmp/sr-steam-install.log`.
-Nothing from Valve is stored in this repository; the client comes from Valve's CDN at run time.
+No client binaries are stored here; the client comes from Valve's CDN at run time. `host/pins/` holds the small text
+manifest for build 1788652215, recovered from SteamTracking's archived `steam_client_linuxarm64` history (commit
+[`bbc717da8d`](https://github.com/SteamTracking/SteamTracking/commit/bbc717da8d)). The installer uses this pin when
+the live channel has moved on. Pass `--manifest FILE` or `--manifest-url URL` for other archived manifests.
 
 On demand (Steam must be stopped; `flags` may contain `--force`, `--allow-newer`, `--dry-run`):
 
@@ -76,15 +79,19 @@ am broadcast -a com.steamruntime.dev.CMD --es cmd install [--es pin 1788652215] 
 The default pin is **1788652215** (docs/QUEST.md); it is `DEFAULT_PIN` in `sr-steam-install`. Override with `--pin`,
 `SR_STEAM_PIN`, or the `pin` extra above. Channel defaults to `steamdeck_publicbeta` (`steamdeck_stable` is also tried).
 
-**Valve serves only the current build per channel**, so an old pin installs only if its manifest is still live or
-archived. The installer archives every pinned manifest it sees in `/root/.sr-steam-install/manifests/`; to keep a build
-reproducible, run the installer while it is current, or place a saved manifest there as
-`steam_client_<channel>_linuxarm64.<build>` (or pass `--manifest FILE`). If the pin is not available it exits 3 with a
-`PINNED BUILD ... NOT AVAILABLE` message listing the live builds and installs nothing.
+**Valve serves only the current manifest per channel.** Older manifests can be recovered from tracker history or the
+Wayback/Internet Archive captures described in [Lightwo's Steam client downgrades survival kit](https://blog.lightwo.net/steam-client-downgrades-survival-kit.html).
+The table pairs build IDs with archived manifest captures; package zips use the manifest's hashed filenames. Zips may
+disappear from Valve's CDN over time, so check availability with `--dry-run` (it sends `HEAD` for each package). The
+installer archives pins it sees in `/root/.sr-steam-install/manifests/`; alternatively supply a local manifest or URL.
+Manifests are text metadata only; package downloads are still size and SHA-256 checked.
 
 To bump the pin:
 
-1. Check what Valve serves: `sr-steam-install --dry-run` (downloads only the manifest, lists the files and sizes).
+1. Check what Valve serves: `sr-steam-install --dry-run` (reads a manifest and sends `HEAD` for each package). For an
+   older pin, see `host/pins/` or use `--manifest FILE` / `--manifest-url URL`. Lightwo's
+   [downgrade table](https://blog.lightwo.net/steam-client-downgrades-survival-kit.html) maps build IDs to archived
+   manifests; package zips use hashed filenames and may expire from Valve's CDN.
 2. Rebuild the port against the new build's `androidarm64` libs and check the shim's interface remap (docs/QUEST.md:
    build 1792618285 broke the port with `GetSteamEnvironmentForApp` code 12).
 3. Change `DEFAULT_PIN` in `host/overlay/.../rootfs-shims/sr-steam-install` and the copy under `host/overlay-quest/`,

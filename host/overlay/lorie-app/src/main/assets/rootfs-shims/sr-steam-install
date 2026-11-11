@@ -7,7 +7,7 @@
 # the client is downloaded from Valve's public client CDN onto the device at run time.
 #
 # What it does
-#   1. Fetches the channel manifest (steam_client_<channel>_linuxarm64) from Valve's client CDN.
+#   1. Fetches the channel manifest (steam_client_<channel>_linuxarm64) from Valve's client CDN or an archive.
 #   2. Requires the manifest's build ID to equal the PIN (default 1788652215). Valve only serves the
 #      *current* manifest per channel, so older pins are reproducible only from an archived manifest
 #      (see "Pins and archived manifests" in host/README.md). It never silently installs a newer build.
@@ -19,7 +19,7 @@
 #
 # Usage: sr-steam-install [--dry-run] [--if-missing] [--pin-only] [--force] [--allow-newer]
 #                         [--pin BUILD_ID] [--channel steamdeck_publicbeta|steamdeck_stable]
-#                         [--manifest FILE] [--root DIR]
+#                         [--manifest FILE | --manifest-url URL] [--root DIR]
 # Environment: SR_STEAM_PIN, SR_STEAM_CHANNEL, SR_STEAM_ROOT, SR_STEAM_CDNS, SR_STEAM_RETRY_DELAYS
 # Exit codes: 0 ok / already satisfied, 1 error, 2 usage, 3 pinned build not available, 4 manifest has
 #             no arm64 package.
@@ -33,7 +33,7 @@ STABLE_CHANNEL=steamdeck_stable
 pin=${SR_STEAM_PIN:-$DEFAULT_PIN}
 channel=${SR_STEAM_CHANNEL:-$BETA_CHANNEL}
 root=${SR_STEAM_ROOT:-/root}
-dry_run="" if_missing="" pin_only="" force="" allow_newer="" manifest_file=""
+dry_run="" if_missing="" pin_only="" force="" allow_newer="" manifest_file="" manifest_url=""
 
 log() { echo "sr-steam-install: $(date -u +%H:%M:%S) $*"; }
 err() { echo "sr-steam-install: ERROR: $*" >&2; }
@@ -49,6 +49,7 @@ while [ $# -gt 0 ]; do
     --pin) [ $# -ge 2 ] || die 2 "--pin needs a value"; pin=$2; shift ;;
     --channel) [ $# -ge 2 ] || die 2 "--channel needs a value"; channel=$2; shift ;;
     --manifest) [ $# -ge 2 ] || die 2 "--manifest needs a file"; manifest_file=$2; shift ;;
+    --manifest-url) [ $# -ge 2 ] || die 2 "--manifest-url needs a URL"; manifest_url=$2; shift ;;
     --root) [ $# -ge 2 ] || die 2 "--root needs a directory"; root=$2; shift ;;
     -h|--help) sed -n '2,/^set -eu/p' "$0" | sed '$d'; exit 0 ;;
     *) die 2 "unknown option: $1" ;;
@@ -176,7 +177,20 @@ chosen_version=""
 pin_ok=""
 live_report=""
 
-if [ -n "$manifest_file" ]; then
+if [ -n "$manifest_file" ] && [ -n "$manifest_url" ]; then
+  die 2 "use only one of --manifest and --manifest-url"
+elif [ -n "$manifest_url" ]; then
+  if ! curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-connrefused --retry-delay 3 \
+       "$manifest_url" -o "$work/archive.manifest"; then
+    die 1 "could not download manifest from $manifest_url"
+  fi
+  chosen=$work/archive.manifest
+  chosen_channel=$channel
+  chosen_version=$(version_of "$chosen")
+  [ -n "$chosen_version" ] || die 1 "no \"version\" in manifest URL $manifest_url"
+  log "using archived manifest $manifest_url (build $chosen_version)"
+  [ "$chosen_version" = "$pin" ] && pin_ok=1
+elif [ -n "$manifest_file" ]; then
   [ -f "$manifest_file" ] || die 1 "manifest file not found: $manifest_file"
   chosen=$manifest_file
   chosen_channel=$channel
@@ -215,6 +229,19 @@ else
       fi
     done
   fi
+  if [ -z "$chosen" ]; then
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    for ch in $channels; do
+      for arch in "$script_dir/${ch}_${pin}.manifest" "$script_dir/../../../../../../pins/${ch}_${pin}.manifest"; do
+        if [ -f "$arch" ]; then
+          chosen=$arch chosen_channel=$ch chosen_version=$(version_of "$arch")
+          [ "$chosen_version" = "$pin" ] && pin_ok=1
+          log "using bundled archived manifest $arch (build $chosen_version)"
+          break 2
+        fi
+      done
+    done
+  fi
   if [ -z "$chosen" ] && [ -n "$first_live" ]; then
     chosen=$first_live chosen_channel=$first_live_channel chosen_version=$(version_of "$first_live")
   fi
@@ -244,7 +271,13 @@ total_bytes=$(awk '{ n += $4 } END { print n + 0 }' "$work/parts")
 if [ -n "$dry_run" ]; then
   log "DRY RUN: $chosen_name build $chosen_version (pin $pin): $total package files, $total_bytes bytes ($((total_bytes / 1000000)) MB)"
   while read -r block file sum size; do
-    printf '  %-36s %12s  sha256=%s  %s\n' "$block" "$size" "$sum" "$file"
+    reachable=""
+    for host in ${cdn:-} $CDN_LIST; do
+      [ -n "$host" ] || continue
+      status=$(curl -sSIL --connect-timeout 10 --max-time 20 -o /dev/null -w '%{http_code}' "$host/$file" 2>/dev/null || true)
+      if [ "$status" = 200 ]; then reachable="$host (HTTP 200)"; break; fi
+    done
+    printf '  %-36s %12s  sha256=%s  %s  HEAD=%s\n' "$block" "$size" "$sum" "$file" "${reachable:-unavailable}"
   done < "$work/parts"
   if [ -n "$pin_ok" ]; then
     log "RESULT: pinned build $pin is AVAILABLE on channel $chosen_channel"

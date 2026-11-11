@@ -729,7 +729,7 @@ public class SteamRuntimeService extends Service {
     }
 
     // ---- Steam client install (manifest installer + prebuilt-rootfs fallback, see host/README.md) ----
-    private static final String[] ROOTFS_SCRIPTS = {"sr-steam-install", "sr-steamrt-shim"};
+    private static final String[] ROOTFS_INSTALL_ASSETS = {"sr-steam-install", "sr-steamrt-shim", "steamdeck_stable_1788652215.manifest"};
     private final Object installLock = new Object();
     private volatile boolean clientPinEnsured = false;
 
@@ -745,12 +745,12 @@ public class SteamRuntimeService extends Service {
         return "";
     }
 
-    /** Copies sr-steam-install / sr-steamrt-shim from the APK assets into the rootfs' /usr/local/bin. */
+    /** Copies the Steam installer assets from the APK into the rootfs' /usr/local/bin. */
     private void installRootfsScripts(File rootfsDir) {
         if (!new File(rootfsDir, "usr").isDirectory()) return;
         File binDir = new File(rootfsDir, "usr/local/bin");
         if (!binDir.isDirectory() && !binDir.mkdirs()) return;
-        for (String name : ROOTFS_SCRIPTS) {
+        for (String name : ROOTFS_INSTALL_ASSETS) {
             try (InputStream is = getAssets().open("rootfs-shims/" + name)) {
                 java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
                 byte[] buf = new byte[8192];
@@ -760,11 +760,13 @@ public class SteamRuntimeService extends Service {
                 File target = new File(binDir, name);
                 if (!target.exists() || !java.util.Arrays.equals(Files.readAllBytes(target.toPath()), bytes)) {
                     Files.write(target.toPath(), bytes);
-                    try {
-                        Os.chmod(target.getAbsolutePath(), 0755);
-                    } catch (Exception ignored) {}
-                    target.setExecutable(true, false);
-                    target.setReadable(true, false);
+                    if (name.startsWith("sr-")) {
+                        try {
+                            Os.chmod(target.getAbsolutePath(), 0755);
+                        } catch (Exception ignored) {}
+                        target.setExecutable(true, false);
+                        target.setReadable(true, false);
+                    }
                     Log.i(TAG, "Installed " + name + " into rootfs /usr/local/bin");
                 }
             } catch (java.io.FileNotFoundException e) {
