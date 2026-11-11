@@ -1,0 +1,87 @@
+#!/bin/bash
+# sr-steamrt-shim: pressure-vessel / Steam Runtime container guard for the arm64 Steam client under PRoot.
+#
+# Adapted from DroidDeck's `droiddeck-steamrt-shim` (GPL-3.0, https://github.com/Droid-Deck/DroidDeck,
+# docs/development/arm64-steam-client.md); see NOTICE.md.
+#
+# If a future arm64 client ships containerized (Valve's Steam Runtime "steamrt" with pressure-vessel), it
+# needs unprivileged user/mount namespaces (bwrap) that neither Android nor PRoot provide. The host
+# exports STEAM_STEAMRT_RECURSION_GUARD=1 (the client then believes it is already inside its container and
+# does not re-exec through pressure-vessel-wrap). This script covers the remaining part: it builds a
+# shim runtime directory in which
+#   - Valve's runtime files are symlinked one by one,
+#   - steam-runtime-check-requirements is replaced by `exit 0`,
+#   - steam-runtime-launch-client runs the requested command directly.
+# and writes <shim>/env for the launcher to source (STEAM_RUNTIME_STEAMRT, PATH).
+#
+# It does nothing (exit 1, shim removed) unless the client carries pv-runtime/steam-runtime-steamrt or a
+# steam-runtime-check-requirements probe, so the current non-containerized client starts unchanged.
+#
+# Usage: sr-steamrt-shim [--quiet] [CLIENT_DIR [SHIM_DIR]]
+#        defaults: /root/steamrtarm64 /root/.sr-steamrt-shim
+set -eu
+
+quiet=""
+if [ "${1:-}" = --quiet ]; then quiet=1; shift; fi
+client=${1:-/root/steamrtarm64}
+shim=${2:-/root/.sr-steamrt-shim}
+
+srt_real=$client/pv-runtime/steam-runtime-steamrt
+if [ ! -d "$srt_real" ]; then
+  probe=$(find "$client" -maxdepth 4 -name steam-runtime-check-requirements -path '*/bin/*' -print -quit 2> /dev/null || true)
+  srt_real=${probe:+${probe%/bin/*}}
+fi
+if [ -z "$srt_real" ] || [ ! -d "$srt_real" ]; then
+  rm -rf "$shim"
+  exit 1
+fi
+
+rm -rf "$shim"
+trap 'rm -rf "$shim"' ERR
+
+mkdir -p "$shim/bin"
+for e in "$srt_real"/* "$srt_real"/.[!.]*; do
+  [ -e "$e" ] || continue
+  [ "$(basename "$e")" = bin ] || ln -s "$e" "$shim/$(basename "$e")"
+done
+for e in "$srt_real"/bin/*; do
+  [ -e "$e" ] || continue
+  ln -s "$e" "$shim/bin/$(basename "$e")"
+done
+
+rm -f "$shim/bin/steam-runtime-check-requirements"
+printf '#!/bin/sh\nexit 0\n' > "$shim/bin/steam-runtime-check-requirements"
+chmod 755 "$shim/bin/steam-runtime-check-requirements"
+
+rm -f "$shim/bin/steam-runtime-launch-client"
+cat > "$shim/bin/steam-runtime-launch-client" << 'LAUNCH'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+  case $1 in
+    --) shift; break ;;
+    --directory=*) cd "${1#--directory=}" || exit 127 ;;
+    --env=*) export "${1#--env=}" ;;
+    --unset-env=*) unset "${1#--unset-env=}" ;;
+    --directory|--env|--unset-env)
+      [ $# -ge 2 ] || exit 127
+      case $1 in
+        --directory) cd "$2" || exit 127 ;;
+        --env) export "$2" ;;
+        --unset-env) unset "$2" ;;
+      esac
+      shift ;;
+  esac
+  shift
+done
+[ $# -gt 0 ] || exit 0
+exec "$@"
+LAUNCH
+chmod 755 "$shim/bin/steam-runtime-launch-client"
+
+cat > "$shim/env" << ENV
+export STEAM_STEAMRT_RECURSION_GUARD=1
+export STEAM_RUNTIME_STEAMRT=$shim
+export PATH=$shim/bin:\$PATH
+ENV
+
+[ -n "$quiet" ] || echo "sr-steamrt-shim: the arm64 client is containerized (steamrt); shim at $shim"

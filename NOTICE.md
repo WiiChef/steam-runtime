@@ -18,3 +18,5 @@ Agreement and Steam Subscriber Agreement. The Steamworks API function and interf
 
 Other components keep their own licences: `host/` derives from Termux:X11 (GPLv3); PRoot, talloc and the
 Debian rootfs used by the host are separate projects and are not included.
+
+**DroidDeck attribution.** host/overlay/lorie-app/src/main/assets/rootfs-shims/sr-steam-install and sr-steamrt-shim (and the overlay-quest copies) are adapted from droiddeck-steam-install and droiddeck-steamrt-shim of DroidDeck (https://github.com/Droid-Deck/DroidDeck, 	ools/linuxfs/overlay/usr/local/bin/, docs/development/arm64-steam-client.md), licensed GPL-3.0, and are distributed here under GPL-3.0 (compatible with the GPLv3 host/). They download Valve's client from Valve's public client CDN at run time; no Valve binaries are included.

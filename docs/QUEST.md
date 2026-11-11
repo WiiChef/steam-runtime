@@ -31,3 +31,5 @@ When the pin works, the bootstrap log says `Suppressing Steam update`. The host 
 ## Rootfs
 
 Source: `rootfs-v955.tar` (Debian trixie aarch64 + Valve `steamrtarm64`), not in this repo. Push it to `/sdcard/Android/data/com.steamruntime.dev/files/rootfs.tar`, then start the service: `am start-foreground-service -n com.steamruntime.dev/com.termux.x11.SteamRuntimeService -a START`. Also open `MainActivity` so the X display has a surface.
+
+The pin is also the default of the manifest installer (sr-steam-install, see [host/README.md](../host/README.md#steam-client-install-manifest-installer-pinned-build)). As of 2026-11-11 Valve's CDN no longer serves 1788652215: the live channels carry 1793740892 (steamdeck_publicbeta) and 1792618285 (steamdeck_stable), so a fresh manifest install of the pin needs an archived manifest; the prebuilt rootfs path is unaffected.
