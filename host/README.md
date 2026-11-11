@@ -26,6 +26,25 @@ It is a modified [Termux:X11](https://github.com/termux/termux-x11) (GPLv3), so 
 - Ports run in a **separate APK** with the same `android:sharedUserId` and signing key so they can read the host's
   `files/ipc`. Ports never run inside the container.
 
+## Status: client build and login state
+
+`status.json` (written by `SteamStatusExtras`, same in `overlay/` and `overlay-quest/`) additionally contains:
+
+- `client_build`, `client_build_source`, `client_builddate`: identity of the Steam client in the rootfs (manifest
+  `version` in `/root/steamrtarm64/package/steam_client_*.manifest`, else `builddate.txt`). The shim compares it with
+  `client_build=` in `steamclient_patches.conf` (see `docs/PATCH_CONF.md`).
+- `logged_on`, `account_present`, `owned_apps`, `probe_ifaces`, `login_probe`, `login_probe_error`,
+  `login_probe_time`: result of `steamstate` (`rootfs-shims/steamstate.c`), a one-shot helper run inside PRoot
+  (bounded by `timeout` and `alarm`, at most every 30 s, only once Steam and its IPC object are up). It tries
+  `SteamClient021..017`, `SteamUser023..019`, `STEAMAPPS_INTERFACE_VERSION009..007` newest first and reports the
+  versions that worked. `logged_on` is `null` while unknown. The SteamID is never published.
+- Appids to check ownership of: `am broadcast -a com.steamruntime.dev.CMD --es cmd status --es appids 2868840,480`
+  (stored in `files/probe_appids.txt`).
+
+Build the helper like the other rootfs shims and place it in `lorie-app/src/main/assets/rootfs-shims/steamstate`:
+`gcc -O2 -Wall -o steamstate steamstate.c -ldl` (aarch64 glibc, e.g. inside the rootfs). If the asset is absent
+the probe reports `login_probe: "unavailable"` and everything else works as before.
+
 ## Building
 
 ```bash

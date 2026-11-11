@@ -26,7 +26,7 @@ BootStrapperInhibitAll=enable
 BootStrapperForceSelfUpdate=disable
 ```
 
-When the pin works, the bootstrap log says `Suppressing Steam update`. To move to a newer client, remove the pin, let Steam update, rebuild the port with the new `/root/androidarm64` libs, and re-check the shim's interface remap.
+When the pin works, the bootstrap log says `Suppressing Steam update`. The host publishes the running client's build as `client_build` in `status.json`; put it in `steamclient_patches.conf` as `client_build=` and the shim refuses to patch/attach on a mismatch (see `PATCH_CONF.md`). To move to a newer client, remove the pin, let Steam update, rebuild the port with the new `/root/androidarm64` libs, and re-check the shim's interface remap.
 
 ## Rootfs
 

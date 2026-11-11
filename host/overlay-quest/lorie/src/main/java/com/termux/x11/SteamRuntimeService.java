@@ -447,6 +447,8 @@ public class SteamRuntimeService extends Service {
         File ipcFile = new File(filesDir, "ipc/u0-ValveIPCSharedObj-Steam");
         boolean ipcObjectReady = ipcFile.exists() && ipcFile.length() == 2097152L;
 
+        String extras = SteamStatusExtras.fragment(context, serviceInstance, rootfsTarget, steamAlive && ipcObjectReady);
+
         String json = "{\n"
                 + "  \"service_running\": " + running + ",\n"
                 + "  \"rootfs_ready\": " + rootfsReady + ",\n"
@@ -461,7 +463,7 @@ public class SteamRuntimeService extends Service {
                 + "  \"proc_net_readable\": " + procNetReadable + ",\n"
                 + "  \"proc_net_lines\": " + procNetLines + ",\n"
                 + "  \"ipc_object\": " + ipcObjectReady + ",\n"
-                + "  \"state\": \"" + state + "\"\n"
+                + "  \"state\": \"" + state + "\"" + extras + "\n"
                 + "}\n";
 
         try {
@@ -476,6 +478,11 @@ public class SteamRuntimeService extends Service {
         }
     }
 
+    /** Runs a bash command inside PRoot and returns its stdout, or null on timeout (used by the login probe). */
+    String runInProot(String bashCmd, int timeoutSec) throws Exception {
+        Process p = startProotSteamProcess(buildProotSteamCmd(bashCmd));
+        return SteamStatusExtras.collect(p, timeoutSec);
+    }
     private void updateStatus() {
         writeStatus(this, this);
     }

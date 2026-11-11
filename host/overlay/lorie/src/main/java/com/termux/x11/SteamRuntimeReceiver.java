@@ -19,6 +19,9 @@ public class SteamRuntimeReceiver extends BroadcastReceiver {
         Log.i(TAG, "Received CMD broadcast: " + cmd);
 
         if ("status".equalsIgnoreCase(cmd)) {
+            // Optional: --es appids 2868840,480 sets the appids whose ownership the login probe queries.
+            String appids = intent.getStringExtra("appids");
+            if (appids != null) SteamStatusExtras.setAppIds(context, appids);
             SteamRuntimeService.writeStatus(context, SteamRuntimeService.getInstance());
         } else if ("start".equalsIgnoreCase(cmd)) {
             Intent serviceIntent = new Intent(context, SteamRuntimeService.class);
