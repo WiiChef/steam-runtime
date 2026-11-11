@@ -12,6 +12,8 @@
 //   u32 <off> <val>        write one 32-bit word (code pages made writable, icache flushed)
 //   ptr <off>              write the shim's install-path string pointer (8 bytes)
 //   fn  <name> <off>       named function offset, looked up with pc_fn()
+//   client_build=<id>      optional: the client build these patches were made for. Compared with the
+//                          "client_build" the host publishes in status.json; see pc_client_build().
 #ifndef STEAM_PATCHCONF_H
 #define STEAM_PATCHCONF_H
 
@@ -32,6 +34,7 @@ typedef struct {
 
 static pc_entry g_pc[PC_MAX];
 static int g_pc_n = -1;
+static char g_pc_build[64];
 
 static void pc_load(void) {
     if (g_pc_n >= 0) return;
@@ -49,6 +52,18 @@ static void pc_load(void) {
     while (g_pc_n < PC_MAX && fgets(line, sizeof(line), f)) {
         char *hash = strchr(line, '#');
         if (hash) *hash = 0;
+        const char *kv = line + strspn(line, " \t");
+        if (!strncmp(kv, "client_build", 12)) {
+            const char *v = kv + 12 + strspn(kv + 12, " \t");
+            if (*v == '=') {
+                v += 1 + strspn(v + 1, " \t");
+                size_t l = strcspn(v, " \t\r\n");
+                if (l >= sizeof(g_pc_build)) l = sizeof(g_pc_build) - 1;
+                memcpy(g_pc_build, v, l);
+                g_pc_build[l] = 0;
+                continue;
+            }
+        }
         pc_entry e;
         memset(&e, 0, sizeof(e));
         char a[40] = {0}, b[40] = {0}, c[40] = {0};
@@ -105,6 +120,12 @@ static uint64_t pc_fn(const char *name) {
     for (int i = 0; i < g_pc_n; i++)
         if (!strcmp(g_pc[i].kind, "fn") && !strcmp(g_pc[i].name, name)) return g_pc[i].off;
     return 0;
+}
+
+// The conf's `client_build=` value, or "" when the key is absent.
+static const char *pc_client_build(void) {
+    pc_load();
+    return g_pc_build;
 }
 
 #endif

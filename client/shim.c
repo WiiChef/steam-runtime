@@ -22,6 +22,7 @@
 #include <pthread.h>
 #include <android/log.h>
 #include "patchconf.h"
+#include "statusjson.h"
 
 #define APPID "2868840"
 #define LOG_TAG "StS2Shim"
@@ -66,9 +67,57 @@ static uintptr_t GetModuleBase(const char* module_name) {
 
 static char s_steamInstallPath[256] = "/data/user/0/com.steamruntime.dev/files";
 
+// Build-ID guard. The patches in steamclient_patches.conf are only valid for one Steam client build.
+// If the conf carries `client_build=<id>` and the host's status.json says a different client is
+// running, applying them would corrupt libsteamclient.so, so refuse to patch and to attach.
+// Missing key (conf or status.json) = old behaviour plus a warning.
+static char s_guardMsg[256];
+
+// Returns 1 if the configured build does not match the running client (s_guardMsg says why).
+static int check_build_guard(void) {
+    static int warned_nokey = 0;
+    s_guardMsg[0] = 0;
+    const char *want = pc_client_build();
+    if (!want[0]) {
+        if (!warned_nokey) {
+            warned_nokey = 1;
+            LOGW("steamclient_patches.conf has no client_build= key: cannot verify the running Steam client matches these patches");
+        }
+        return 0;
+    }
+    char json[8192], have[64] = {0};
+    if (sj_read(json, sizeof(json), NULL) < 0) {
+        LOGW("Build guard: cannot read host status.json; cannot verify client build (conf wants %s)", want);
+        return 0;
+    }
+    if (!sj_get(json, "client_build", have, sizeof(have)) || !have[0]) {
+        LOGW("Build guard: host status.json has no client_build; cannot verify client build (conf wants %s)", want);
+        return 0;
+    }
+    if (strcmp(want, have) != 0) {
+        snprintf(s_guardMsg, sizeof(s_guardMsg),
+                 "Steam client build mismatch: running client is %s but steamclient_patches.conf is for %s; not patching or attaching",
+                 have, want);
+        LOGE("%s", s_guardMsg);
+        return 1;
+    }
+    LOGI("Build guard: client build %s matches steamclient_patches.conf", have);
+    return 0;
+}
+
+// Reads the host's login probe. Returns 1 if the host says no account is logged on.
+static int host_reports_logged_out(void) {
+    char json[8192], v[16] = {0};
+    if (sj_read(json, sizeof(json), NULL) < 0) return 0;
+    return sj_get(json, "logged_on", v, sizeof(v)) && strcmp(v, "false") == 0;
+}
+
+#define LOGIN_HINT "Steam is not logged in: log in to Steam in the Steam Runtime app, then restart this app"
+
 // Runtime patches to the locally supplied libsteamclient.so. The offsets and instruction words are
 // not part of this repo; they are read from a private steamclient_patches.conf (see patchconf.h).
 static void PatchSteamClientPaths(void) {
+    if (check_build_guard()) return;
     uintptr_t clientBase = GetModuleBase("libsteamclient.so");
     if (!clientBase) {
         LOGW("Cannot find libsteamclient.so base in /proc/self/maps yet");
@@ -383,6 +432,13 @@ int SteamInternal_SteamAPI_Init(const char *version, char *err) {
     setenv("SteamAppId", APPID, 1);
     setenv("SteamGameId", APPID, 1);
 
+    if (check_build_guard()) {
+        // Do not patch and do not attach: fail cleanly instead of crashing inside libsteamclient.so.
+        if (err) snprintf(err, 1024, "%s", s_guardMsg);
+        return 1;
+    }
+    if (host_reports_logged_out()) LOGW("%s", LOGIN_HINT);
+
     PatchSteamClientPaths();
 
     void *h = real_handle();
@@ -406,7 +462,12 @@ int SteamInternal_SteamAPI_Init(const char *version, char *err) {
     }
     LOGI("SteamAPI_Init real call #%u returned=%d pid=%d err=%s", real_n, r, (int)getpid(), local_err);
     if (err && local_err[0]) {
-        strncpy(err, local_err, 1024);
+        strncpy(err, local_err, 1023);
+        err[1023] = 0;
+    }
+    if (r != 0 && host_reports_logged_out()) {
+        LOGE("%s", LOGIN_HINT);
+        if (err) snprintf(err, 1024, "%s (%s)", LOGIN_HINT, local_err[0] ? local_err : "init failed");
     }
     return r;
 }
