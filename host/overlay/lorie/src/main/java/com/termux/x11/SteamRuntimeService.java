@@ -131,6 +131,11 @@ public class SteamRuntimeService extends Service {
             return START_NOT_STICKY;
         }
 
+        if ("INSTALL".equalsIgnoreCase(action)) {
+            handleInstallRequest(intent.getStringExtra("pin"), intent.getStringExtra("channel"),
+                    intent.getStringExtra("flags"));
+            return START_NOT_STICKY;
+        }
         if ("START".equalsIgnoreCase(action) || action == null) {
             stopRequested = false;
             if (!isRunning || workerThread == null || !workerThread.isAlive()) {
@@ -457,6 +462,7 @@ public class SteamRuntimeService extends Service {
                 + "  \"last_exit_time\": " + lastExitTime + ",\n"
                 + "  \"steam_login_state\": \"" + steamLoginState + "\",\n"
                 + "  \"render_mode\": \"" + renderMode + "\",\n"
+                + "  \"pinned_build_id\": \"" + readPinnedBuildId(rootfsTarget) + "\",\n"
                 + "  \"proc_net_readable\": " + procNetReadable + ",\n"
                 + "  \"proc_net_lines\": " + procNetLines + ",\n"
                 + "  \"ipc_object\": " + ipcObjectReady + ",\n"
@@ -715,6 +721,136 @@ public class SteamRuntimeService extends Service {
         }
     }
 
+    // ---- Steam client install (manifest installer + prebuilt-rootfs fallback, see host/README.md) ----
+    private static final String[] ROOTFS_SCRIPTS = {"sr-steam-install", "sr-steamrt-shim"};
+    private final Object installLock = new Object();
+    private volatile boolean clientPinEnsured = false;
+
+    /** Build ID the client is pinned to, written by sr-steam-install; "" if unknown. */
+    static String readPinnedBuildId(File rootfsTarget) {
+        try {
+            File f = new File(rootfsTarget, "root/steamrtarm64/pinned_build_id");
+            if (f.canRead()) {
+                String s = new String(Files.readAllBytes(f.toPath()), "UTF-8").trim();
+                if (s.matches("[0-9]{1,20}")) return s;
+            }
+        } catch (Exception ignored) {}
+        return "";
+    }
+
+    /** Copies sr-steam-install / sr-steamrt-shim from the APK assets into the rootfs' /usr/local/bin. */
+    private void installRootfsScripts(File rootfsDir) {
+        if (!new File(rootfsDir, "usr").isDirectory()) return;
+        File binDir = new File(rootfsDir, "usr/local/bin");
+        if (!binDir.isDirectory() && !binDir.mkdirs()) return;
+        for (String name : ROOTFS_SCRIPTS) {
+            try (InputStream is = getAssets().open("rootfs-shims/" + name)) {
+                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int r;
+                while ((r = is.read(buf)) != -1) baos.write(buf, 0, r);
+                byte[] bytes = baos.toByteArray();
+                File target = new File(binDir, name);
+                if (!target.exists() || !java.util.Arrays.equals(Files.readAllBytes(target.toPath()), bytes)) {
+                    Files.write(target.toPath(), bytes);
+                    try {
+                        Os.chmod(target.getAbsolutePath(), 0755);
+                    } catch (Exception ignored) {}
+                    target.setExecutable(true, false);
+                    target.setReadable(true, false);
+                    Log.i(TAG, "Installed " + name + " into rootfs /usr/local/bin");
+                }
+            } catch (java.io.FileNotFoundException e) {
+                Log.i(TAG, "Asset rootfs-shims/" + name + " not bundled in this build");
+            } catch (Exception e) {
+                Log.w(TAG, "Failed installing " + name + ": " + e.getMessage());
+            }
+        }
+    }
+
+    private static boolean pathPresent(File f) {
+        return f.exists() || Files.isSymbolicLink(f.toPath());
+    }
+
+    /** Runs sr-steam-install inside PRoot; output is appended to files/tmp/sr-steam-install.log. */
+    private int runRootfsInstaller(String flags, String pin, String channel) {
+        synchronized (installLock) {
+            StringBuilder cmd = new StringBuilder();
+            if (pin != null && pin.matches("[0-9]{6,12}")) cmd.append("SR_STEAM_PIN=").append(pin).append(' ');
+            if (channel != null && channel.matches("[a-z_]{4,32}")) cmd.append("SR_STEAM_CHANNEL=").append(channel).append(' ');
+            cmd.append("/usr/local/bin/sr-steam-install ").append(flags)
+                    .append(" >> /tmp/sr-steam-install.log 2>&1");
+            Log.i(TAG, "Running rootfs installer: " + cmd);
+            try {
+                Process p = startProotSteamProcess(buildProotSteamCmd(cmd.toString()));
+                for (final InputStream s : new InputStream[]{p.getInputStream(), p.getErrorStream()}) {
+                    new Thread(() -> {
+                        try {
+                            byte[] b = new byte[4096];
+                            while (s.read(b) >= 0) { /* drain */ }
+                        } catch (IOException ignored) {}
+                    }, "sr-install-drain").start();
+                }
+                if (!p.waitFor(60, java.util.concurrent.TimeUnit.MINUTES)) {
+                    p.destroyForcibly();
+                    Log.w(TAG, "sr-steam-install timed out");
+                    return -1;
+                }
+                int rc = p.exitValue();
+                Log.i(TAG, "sr-steam-install exited with " + rc + " (log: files/tmp/sr-steam-install.log)");
+                return rc;
+            } catch (Exception e) {
+                Log.w(TAG, "sr-steam-install failed to run: " + e.getMessage());
+                return -1;
+            }
+        }
+    }
+
+    /**
+     * Prebuilt rootfs (client already present): leave it untouched, only make sure the pin flags are set and
+     * its build ID is recorded. No client in the rootfs: install the pinned build from Valve's CDN by manifest.
+     */
+    private void ensureSteamClient(File rootfsDir) {
+        if (!new File(rootfsDir, "usr/local/bin/sr-steam-install").exists()) return;
+        boolean present = pathPresent(new File(rootfsDir, "root/steamrtarm64/steam"));
+        if (present) {
+            if (clientPinEnsured) return;
+            runRootfsInstaller("--pin-only", null, null);
+            clientPinEnsured = true;
+        } else {
+            Log.i(TAG, "No steamrtarm64 client in rootfs; running the manifest installer (pin from docs/QUEST.md)");
+            updateNotification("Steam: installing client\u2026");
+            if (runRootfsInstaller("--if-missing", null, null) == 0) clientPinEnsured = true;
+            updateStatus();
+        }
+    }
+
+    /** On-demand install: am broadcast -a com.steamruntime.dev.CMD --es cmd install [--es pin ID] [--es channel NAME] [--es flags "--force"] */
+    private void handleInstallRequest(final String pin, final String channel, String flagsExtra) {
+        final StringBuilder flags = new StringBuilder();
+        boolean dry = false;
+        if (flagsExtra != null) {
+            for (String t : flagsExtra.trim().split("\\s+")) {
+                if (t.matches("--(force|allow-newer|dry-run)")) {
+                    flags.append(t).append(' ');
+                    if (t.equals("--dry-run")) dry = true;
+                }
+            }
+        }
+        final boolean dryRun = dry;
+        new Thread(() -> {
+            File rootfsDir = new File(getFilesDir(), "rootfs/debian-trixie-aarch64");
+            installRootfsScripts(rootfsDir);
+            if (!dryRun && findSteamPid() > 0) {
+                Log.w(TAG, "Refusing to install while Steam is running; send cmd stop first");
+                return;
+            }
+            runRootfsInstaller(flags.toString().trim(), pin, channel);
+            clientPinEnsured = false;
+            updateStatus();
+            if (!isRunning) stopSelf();
+        }, "sr-install").start();
+    }
     public static class KnownPort {
         public final String name;
         public final String packageName;
@@ -1347,6 +1483,8 @@ public class SteamRuntimeService extends Service {
             steamCmd.add("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
             steamCmd.add("DISPLAY=:0");
             steamCmd.add("STEAM_RUNTIME=0");
+            // Defensive: if a future arm64 client ships containerized (pressure-vessel), do not re-exec it through bwrap.
+            steamCmd.add("STEAM_STEAMRT_RECURSION_GUARD=1");
             String mesa = "/opt/mesa-kgsl";
             String ldPreload = "/usr/local/lib/librobustshim.so";
             if (useGpu) {
@@ -1386,7 +1524,7 @@ public class SteamRuntimeService extends Service {
                 steamCmd.add(customBashCmd);
             } else {
                 String gpuFlag = useGpu ? "" : "-cef-disable-gpu ";
-                String steamLaunchCmd = "openbox & sleep 1; exec /usr/bin/env -u LIBGL_ALWAYS_SOFTWARE /root/steamrtarm64/steam -no-cef-sandbox " + gpuFlag + "-chromeosnopreallocate -noverifyfiles " + extraArgs;
+                String steamLaunchCmd = "/usr/local/bin/sr-steamrt-shim --quiet; [ -f /root/.sr-steamrt-shim/env ] && . /root/.sr-steamrt-shim/env; openbox & sleep 1; exec /usr/bin/env -u LIBGL_ALWAYS_SOFTWARE /root/steamrtarm64/steam -no-cef-sandbox " + gpuFlag + "-chromeosnopreallocate -noverifyfiles " + extraArgs;
                 steamCmd.add("dbus-run-session -- /bin/bash -c \"" + steamLaunchCmd + "\"");
             }
         Log.i(TAG, "Final Steam command line: " + steamCmd);
@@ -1910,6 +2048,8 @@ public class SteamRuntimeService extends Service {
                     cleanStaleCrashSentinels(rootfsDir);
                     installRobustShimIfNeeded(rootfsDir);
                     File fakeLsofFile = installFakeLsofIfNeeded(filesDir);
+                    installRootfsScripts(rootfsDir);
+                    ensureSteamClient(rootfsDir);
 
                     // Install launcher script & update shortcuts before Steam launches
                     installLauncherScript(rootfsDir);

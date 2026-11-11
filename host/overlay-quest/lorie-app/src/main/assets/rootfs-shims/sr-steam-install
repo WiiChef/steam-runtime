@@ -1,0 +1,384 @@
+#!/bin/bash
+# sr-steam-install: manifest-based installer for Valve's Linux ARM64 Steam client (steamrtarm64),
+# run INSIDE the PRoot Debian rootfs (installed to /usr/local/bin by SteamRuntimeService).
+#
+# Adapted from DroidDeck's `droiddeck-steam-install` (GPL-3.0, https://github.com/Droid-Deck/DroidDeck,
+# docs/development/arm64-steam-client.md); see NOTICE.md. Nothing from Valve is stored in this repository:
+# the client is downloaded from Valve's public client CDN onto the device at run time.
+#
+# What it does
+#   1. Fetches the channel manifest (steam_client_<channel>_linuxarm64) from Valve's client CDN.
+#   2. Requires the manifest's build ID to equal the PIN (default 1788652215). Valve only serves the
+#      *current* manifest per channel, so older pins are reproducible only from an archived manifest
+#      (see "Pins and archived manifests" in host/README.md). It never silently installs a newer build.
+#   3. Keeps the arm64 platform blocks (*_linuxarm64_linuxarm64 and *_androidarm64_linuxarm64) and the shared blocks (*_all), downloads
+#      each zip (resumable, retried, size + sha256 checked), unpacks into $SR_STEAM_ROOT (default /root).
+#   4. Writes package/beta, the update-inhibit flags in steam.cfg (BootStrapperInhibitAll=enable,
+#      BootStrapperForceSelfUpdate=disable, in /root and the client dir) and <client>/pinned_build_id,
+#      which the host publishes as "pinned_build_id" in status.json.
+#
+# Usage: sr-steam-install [--dry-run] [--if-missing] [--pin-only] [--force] [--allow-newer]
+#                         [--pin BUILD_ID] [--channel steamdeck_publicbeta|steamdeck_stable]
+#                         [--manifest FILE] [--root DIR]
+# Environment: SR_STEAM_PIN, SR_STEAM_CHANNEL, SR_STEAM_ROOT, SR_STEAM_CDNS, SR_STEAM_RETRY_DELAYS
+# Exit codes: 0 ok / already satisfied, 1 error, 2 usage, 3 pinned build not available, 4 manifest has
+#             no arm64 package.
+set -eu
+
+DEFAULT_PIN=1788652215
+CDN_LIST=${SR_STEAM_CDNS:-"https://client-update.steamstatic.com https://client-update.akamai.steamstatic.com https://client-update.fastly.steamstatic.com"}
+BETA_CHANNEL=steamdeck_publicbeta
+STABLE_CHANNEL=steamdeck_stable
+
+pin=${SR_STEAM_PIN:-$DEFAULT_PIN}
+channel=${SR_STEAM_CHANNEL:-$BETA_CHANNEL}
+root=${SR_STEAM_ROOT:-/root}
+dry_run="" if_missing="" pin_only="" force="" allow_newer="" manifest_file=""
+
+log() { echo "sr-steam-install: $(date -u +%H:%M:%S) $*"; }
+err() { echo "sr-steam-install: ERROR: $*" >&2; }
+die() { err "$2"; exit "$1"; }
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    --dry-run) dry_run=1 ;;
+    --if-missing) if_missing=1 ;;
+    --pin-only) pin_only=1 ;;
+    --force) force=1 ;;
+    --allow-newer) allow_newer=1 ;;
+    --pin) [ $# -ge 2 ] || die 2 "--pin needs a value"; pin=$2; shift ;;
+    --channel) [ $# -ge 2 ] || die 2 "--channel needs a value"; channel=$2; shift ;;
+    --manifest) [ $# -ge 2 ] || die 2 "--manifest needs a file"; manifest_file=$2; shift ;;
+    --root) [ $# -ge 2 ] || die 2 "--root needs a directory"; root=$2; shift ;;
+    -h|--help) sed -n '2,/^set -eu/p' "$0" | sed '$d'; exit 0 ;;
+    *) die 2 "unknown option: $1" ;;
+  esac
+  shift
+done
+
+case $pin in ''|*[!0-9]*) die 2 "pin must be a numeric build ID, got '$pin'" ;; esac
+case $channel in
+  beta|publicbeta|"$BETA_CHANNEL") channel=$BETA_CHANNEL ;;
+  stable|"$STABLE_CHANNEL") channel=$STABLE_CHANNEL ;;
+  *) die 2 "unknown channel '$channel' (use $BETA_CHANNEL or $STABLE_CHANNEL)" ;;
+esac
+
+client=$root/steamrtarm64
+state=$root/.sr-steam-install
+pinfile=$client/pinned_build_id
+stamp=$root/package/sr-installed
+
+# --- pin flags (BootStrapperInhibitAll etc.) --------------------------------------------------------
+# Idempotent; keeps any other lines already in steam.cfg.
+set_cfg_key() { # file key value
+  local f=$1 k=$2 v=$3
+  mkdir -p "$(dirname "$f")"
+  [ -f "$f" ] || : > "$f"
+  if grep -q "^$k=" "$f"; then
+    grep -qx "$k=$v" "$f" || { sed "s|^$k=.*|$k=$v|" "$f" > "$f.tmp" && mv -f "$f.tmp" "$f"; }
+  else
+    [ -z "$(tail -c1 "$f" 2>/dev/null)" ] || echo >> "$f"
+    echo "$k=$v" >> "$f"
+  fi
+}
+write_pin_flags() {
+  local d
+  for d in "$root" "$client"; do
+    [ -d "$d" ] || continue
+    set_cfg_key "$d/steam.cfg" BootStrapperInhibitAll enable
+    set_cfg_key "$d/steam.cfg" BootStrapperForceSelfUpdate disable
+  done
+}
+
+# Build ID of what is currently on disk: our stamp, else the package manifest Valve's client keeps.
+installed_build() {
+  local v=""
+  [ -f "$stamp" ] && v=$(tr -dc '0-9' < "$stamp" 2>/dev/null || true)
+  if [ -z "$v" ]; then
+    local m
+    for m in "$root"/package/steam_client_*linuxarm64*.manifest "$root"/package/steam_client_*.manifest; do
+      [ -f "$m" ] || continue
+      v=$(tr -d '\r' < "$m" | awk -F'"' '$2 == "version" { print $4; exit }')
+      [ -n "$v" ] && break
+    done
+  fi
+  echo "$v"
+}
+
+if [ -n "$pin_only" ]; then
+  # Prebuilt-rootfs path: do not touch the client, only make sure the pin flags are set and, if we can
+  # tell which build it is, record it for status.json. An existing pinned_build_id is never overwritten.
+  if [ -d "$client" ]; then
+    write_pin_flags
+    if [ ! -s "$pinfile" ]; then
+      cur=$(installed_build)
+      if [ -n "$cur" ]; then
+        echo "$cur" > "$pinfile"
+        log "recorded build $cur of the existing client in $pinfile"
+      fi
+    fi
+  fi
+  exit 0
+fi
+
+if [ -n "$if_missing" ] && [ -x "$client/steam" ]; then
+  log "client present at $client/steam, nothing to install (prebuilt rootfs path)"
+  write_pin_flags
+  exit 0
+fi
+
+# --- manifest handling ------------------------------------------------------------------------------
+for tool in curl awk; do
+  command -v "$tool" > /dev/null 2>&1 || die 1 "$tool is required inside the rootfs (apt-get install $tool)"
+done
+if [ -z "$dry_run" ]; then
+  command -v sha256sum > /dev/null 2>&1 || die 1 "sha256sum is required"
+  command -v unzip > /dev/null 2>&1 || command -v python3 > /dev/null 2>&1 \
+    || die 1 "unzip or python3 is required to unpack the client (apt-get install unzip)"
+fi
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"; [ -z "${lockdir:-}" ] || rm -rf "$lockdir"' EXIT
+
+version_of() { tr -d '\r' < "$1" | awk -F'"' '$2 == "version" { print $4; exit }'; }
+blocks_of() { tr -d '\r' < "$1" | awk -F'"' '/^\t"/ && NF >= 3 && $4 == "" { printf "%s ", $2 }'; }
+# Components we keep: shared (*_all) and native arm64 (*_linuxarm64_linuxarm64 and *_androidarm64_linuxarm64). The *_steamrt_linuxarm64
+# blocks are Valve's x86-64 client (for FEX) and the *_linuxarm64 blocks of other platforms are skipped.
+parts_of() {
+  tr -d '\r' < "$1" | awk -F'"' '
+    /^\t"/ && NF >= 3 && $4 == "" { block = $2 }
+    $2 == "file" { file[block] = $4 }
+    $2 == "sha2" { sha[block] = $4 }
+    $2 == "size" { size[block] = $4 }
+    END { for (b in file) if (b ~ /_all$/ || b ~ /_linuxarm64_linuxarm64$/ || b ~ /_androidarm64_linuxarm64$/) print b, file[b], sha[b], size[b] + 0 }
+  ' | sort
+}
+
+cdn=""
+cdn_order=""
+fetch_live_manifest() { # channel -> $work/live.<channel>, sets $cdn
+  local ch=$1 name candidate
+  name=steam_client_${ch}_linuxarm64
+  for candidate in ${cdn:-} $CDN_LIST; do
+    if curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-connrefused --retry-delay 3 \
+         "$candidate/$name" -o "$work/live.$ch" 2> /dev/null; then
+      cdn=$candidate
+      return 0
+    fi
+  done
+  return 1
+}
+
+chosen=""        # manifest file we will install from
+chosen_name=""   # steam_client_<channel>_linuxarm64
+chosen_channel=""
+chosen_version=""
+pin_ok=""
+live_report=""
+
+if [ -n "$manifest_file" ]; then
+  [ -f "$manifest_file" ] || die 1 "manifest file not found: $manifest_file"
+  chosen=$manifest_file
+  chosen_channel=$channel
+  chosen_version=$(version_of "$chosen")
+  [ -n "$chosen_version" ] || die 1 "no \"version\" in $manifest_file"
+  log "using manifest file $manifest_file (build $chosen_version)"
+  [ "$chosen_version" = "$pin" ] && pin_ok=1
+else
+  if [ "$channel" = "$BETA_CHANNEL" ]; then channels="$BETA_CHANNEL $STABLE_CHANNEL"; else channels="$STABLE_CHANNEL $BETA_CHANNEL"; fi
+  first_live="" first_live_channel=""
+  for ch in $channels; do
+    if fetch_live_manifest "$ch"; then
+      v=$(version_of "$work/live.$ch")
+      live_report="$live_report $ch=${v:-?}"
+      log "Valve CDN ($cdn) manifest steam_client_${ch}_linuxarm64: build ${v:-unknown}"
+      if [ -z "$first_live" ]; then first_live=$work/live.$ch first_live_channel=$ch; fi
+      if [ "$v" = "$pin" ] && [ -z "$chosen" ]; then
+        chosen=$work/live.$ch chosen_channel=$ch chosen_version=$v pin_ok=1
+        # Archive the pinned manifest so the pin stays reproducible after Valve rotates the channel.
+        if [ -z "$dry_run" ]; then
+          mkdir -p "$state/manifests"
+          cp -f "$chosen" "$state/manifests/steam_client_${ch}_linuxarm64.$pin"
+        fi
+      fi
+    else
+      log "no Steam client CDN answered for steam_client_${ch}_linuxarm64"
+    fi
+  done
+  if [ -z "$chosen" ]; then
+    for ch in $channels; do
+      arch=$state/manifests/steam_client_${ch}_linuxarm64.$pin
+      if [ -f "$arch" ]; then
+        chosen=$arch chosen_channel=$ch chosen_version=$pin pin_ok=1
+        log "pin $pin is gone from the live channels; using archived manifest $arch"
+        break
+      fi
+    done
+  fi
+  if [ -z "$chosen" ] && [ -n "$first_live" ]; then
+    chosen=$first_live chosen_channel=$first_live_channel chosen_version=$(version_of "$first_live")
+  fi
+fi
+
+if [ -z "$chosen" ]; then
+  die 1 "could not obtain any manifest from the Valve client CDN (network? CDNs tried: $CDN_LIST)"
+fi
+chosen_name=steam_client_${chosen_channel}_linuxarm64
+
+if [ -z "$pin_ok" ]; then
+  err "PINNED BUILD $pin NOT AVAILABLE: live manifests carry:${live_report:- none}."
+  err "Valve serves only the current build per channel. Options: supply an archived manifest of build $pin"
+  err "(--manifest FILE, or $state/manifests/steam_client_<channel>_linuxarm64.$pin), or re-pin with"
+  err "--allow-newer / --pin <id> after checking the port still works (docs/QUEST.md, host/README.md)."
+fi
+
+parts_of "$chosen" > "$work/parts"
+if [ ! -s "$work/parts" ]; then
+  err "$chosen_name (build $chosen_version) has no arm64 client package (*_linuxarm64_linuxarm64 blocks);"
+  err "Valve may have renamed or dropped it. Blocks in the manifest: $(blocks_of "$chosen")"
+  exit 4
+fi
+total=$(grep -c . "$work/parts")
+total_bytes=$(awk '{ n += $4 } END { print n + 0 }' "$work/parts")
+
+if [ -n "$dry_run" ]; then
+  log "DRY RUN: $chosen_name build $chosen_version (pin $pin): $total package files, $total_bytes bytes ($((total_bytes / 1000000)) MB)"
+  while read -r block file sum size; do
+    printf '  %-36s %12s  sha256=%s  %s\n' "$block" "$size" "$sum" "$file"
+  done < "$work/parts"
+  if [ -n "$pin_ok" ]; then
+    log "RESULT: pinned build $pin is AVAILABLE on channel $chosen_channel"
+    exit 0
+  fi
+  log "RESULT: pinned build $pin is NOT available (listed files are for live build $chosen_version, not the pin)"
+  exit 3
+fi
+
+if [ -z "$pin_ok" ]; then
+  if [ -n "$allow_newer" ]; then
+    log "--allow-newer: re-pinning to build $chosen_version (was $pin)"
+    pin=$chosen_version
+  else
+    exit 3
+  fi
+fi
+
+# --- already satisfied? -----------------------------------------------------------------------------
+cur=$(installed_build)
+if [ -z "$force" ] && [ -x "$client/steam" ] && [ "$cur" = "$pin" ]; then
+  log "client build $cur already installed and matches the pin; nothing to do"
+  mkdir -p "$client"
+  write_pin_flags
+  echo "$pin" > "$pinfile"
+  exit 0
+fi
+
+# --- single instance lock ---------------------------------------------------------------------------
+mkdir -p "$state"
+lockdir=$state/lock
+if ! mkdir "$lockdir" 2> /dev/null; then
+  oldpid=$(cat "$lockdir/pid" 2> /dev/null || true)
+  if [ -n "$oldpid" ] && kill -0 "$oldpid" 2> /dev/null; then
+    lockdir=""
+    die 1 "another install is running (pid $oldpid)"
+  fi
+  rm -rf "$lockdir"; mkdir "$lockdir"
+fi
+echo $$ > "$lockdir/pid"
+
+# --- download (resumable) and unpack ----------------------------------------------------------------
+order=$cdn
+for candidate in $CDN_LIST; do [ "$candidate" = "$cdn" ] || order="$order $candidate"; done
+[ -n "$order" ] || order=$CDN_LIST
+read -r -a delays <<< "${SR_STEAM_RETRY_DELAYS:-5 10 20 30 30}"
+parts=$state/parts-$pin
+mkdir -p "$parts"
+# Drop leftovers of other pins so a changed pin never mixes files.
+for old in "$state"/parts-*; do [ "$old" = "$parts" ] || rm -rf "$old"; done
+
+size_of() { local n=0; [ -f "$1" ] && n=$(wc -c < "$1"); echo $((n)); }
+
+fetch() { # url dest size sha256 label
+  local url=$1 dest=$2 size=$3 sum=$4 label=$5 failures=0 bad=0 before rc http
+  while :; do
+    if [ -f "$dest" ] && [ "$(size_of "$dest")" -ge "$size" ]; then
+      if [ "$(size_of "$dest")" -eq "$size" ] && echo "$sum  $dest" | sha256sum -c --quiet > /dev/null 2>&1; then
+        return 0
+      fi
+      rm -f "$dest"
+      bad=$((bad + 1))
+      [ "$bad" -lt 3 ] || { err "$label does not match its size/sha256 from the manifest"; return 1; }
+    fi
+    before=$(size_of "$dest")
+    rc=0
+    http=$(curl -fsSL --connect-timeout 30 --speed-limit 4096 --speed-time 60 -w '%{http_code}' -C - \
+             -o "$dest" "$url") || rc=$?
+    if [ "$rc" = 0 ]; then continue; fi
+    case "$rc:${http:-}" in
+      22:416|33:*) rm -f "$dest" ;;   # range not satisfiable / bad resume: restart this file
+      22:4??) err "$label: HTTP $http from ${url%/*}"; return 1 ;;
+    esac
+    if [ "$(size_of "$dest")" -gt "$before" ]; then failures=0; else failures=$((failures + 1)); fi
+    if [ "$failures" -gt "${#delays[@]}" ]; then
+      err "could not download $label (curl exit $rc); partial data kept for the next run"
+      return 1
+    fi
+    local wait=${delays[$((failures > 0 ? failures - 1 : 0))]}
+    log "$label: interrupted (curl exit $rc), retrying in ${wait}s"
+    sleep "$wait"
+  done
+}
+
+unpack() { # zip dest
+  if command -v unzip > /dev/null 2>&1; then
+    # unzip exits 1 for warnings (e.g. backslash path separators) which are fixed up below.
+    unzip -qo "$1" -d "$2" || [ $? -eq 1 ]
+  else
+    python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$1" "$2"
+  fi
+}
+
+log "installing Steam arm64 client build $pin from $chosen_name into $root ($total files, $((total_bytes / 1000000)) MB)"
+i=0
+while read -r block file sum size; do
+  i=$((i + 1))
+  if [ -f "$parts/$file.unpacked" ]; then
+    log "[$i/$total] $block: already unpacked"
+    continue
+  fi
+  log "[$i/$total] $block: $((size / 1000000)) MB"
+  fetched=""
+  for host in $order; do
+    if fetch "$host/$file" "$parts/$file" "$size" "$sum" "$block"; then fetched=$host; break; fi
+  done
+  [ -n "$fetched" ] || die 1 "$file failed on every CDN"
+  mkdir -p "$root"
+  unpack "$parts/$file" "$root"
+  : > "$parts/$file.unpacked"
+  rm -f "$parts/$file"
+done < "$work/parts"
+
+# Valve's zips can carry Windows-style backslash paths; flatten them.
+find "$root" -maxdepth 4 -depth -name '*\\*' 2> /dev/null | while read -r odd; do
+  fixed=${odd//\\//}
+  mkdir -p "$(dirname "$fixed")"
+  if [ -d "$odd" ]; then cp -a "$odd/." "$fixed/" && rm -rf "$odd"; else mv -f "$odd" "$fixed"; fi
+done
+[ -f "$client/steam" ] || die 1 "unpack finished but $client/steam is missing; the package layout may have changed"
+chmod -R a+x "$client" "$root/linuxarm64" 2> /dev/null || true
+chmod +x "$client/steam" 2> /dev/null || true
+
+# Channel the client must run (package/beta has to match the -clientbeta value, else it loops on rc 42),
+# the pin flags, the build ID the host publishes, and the stamp.
+mkdir -p "$root/package"
+echo "$chosen_channel" > "$root/package/beta"
+cp -f "$chosen" "$root/package/$chosen_name.manifest" 2> /dev/null || true
+write_pin_flags
+echo "$pin" > "$pinfile"
+echo "$pin" > "$stamp"
+mkdir -p "$root/.steam"
+for l in "root:$root" "steam:$root" "bin64:$client" "binarm64:$client" "sdkarm64:$root/linuxarm64"; do
+  [ -e "$root/.steam/${l%%:*}" ] || [ -L "$root/.steam/${l%%:*}" ] || ln -sfn "${l#*:}" "$root/.steam/${l%%:*}"
+done
+rm -rf "$parts"
+log "DONE: Steam arm64 client build $pin (channel $chosen_channel) installed; update inhibit flags set"

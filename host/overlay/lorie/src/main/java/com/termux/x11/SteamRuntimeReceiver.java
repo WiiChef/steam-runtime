@@ -28,6 +28,18 @@ public class SteamRuntimeReceiver extends BroadcastReceiver {
             } else {
                 context.startService(serviceIntent);
             }
+        } else if ("install".equalsIgnoreCase(cmd)) {
+            // Manifest install of the pinned Steam client: --es pin ID, --es channel NAME, --es flags "--force --dry-run"
+            Intent serviceIntent = new Intent(context, SteamRuntimeService.class);
+            serviceIntent.setAction("INSTALL");
+            serviceIntent.putExtra("pin", intent.getStringExtra("pin"));
+            serviceIntent.putExtra("channel", intent.getStringExtra("channel"));
+            serviceIntent.putExtra("flags", intent.getStringExtra("flags"));
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(serviceIntent);
+            } else {
+                context.startService(serviceIntent);
+            }
         } else if ("stop".equalsIgnoreCase(cmd)) {
             Intent serviceIntent = new Intent(context, SteamRuntimeService.class);
             serviceIntent.setAction("STOP");
