@@ -57,3 +57,7 @@ python examples/steamtest/tools/convert_ato_patches.py <port shim.c> <libsteamcl
 Push the result to the host's files dir (`adb push` to `/data/local/tmp`, then
 `run-as com.steamruntime.dev cp /data/local/tmp/steamclient_patches.conf files/`). Keep the output private: it is not
 committed.
+
+Verified 2026-11-11 on Quest 3 (host client 1788652215) with a conf generated this way: SteamTest attaches
+(`logged_on=1`), and the StS2 port (shim built as `libsteam_api64.so`, Valve's lib as `libsteam_api.so`) logs
+`Steamworks initialization succeeded!`.
