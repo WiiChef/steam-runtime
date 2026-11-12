@@ -70,6 +70,8 @@ public class SteamRuntimeService extends Service {
 
     private Thread workerThread = null;
     private Thread tailerThread = null;
+    private volatile boolean portWatcherRunning = false;
+    private Thread portWatcherThread = null;
 
     private int lastExitCode = -1;
     private long lastExitTime = 0;
@@ -89,6 +91,71 @@ public class SteamRuntimeService extends Service {
         sInstance = this;
         createNotificationChannel();
         startForegroundInternal("Steam: Initializing...");
+        startPortProcessWatcher();
+    }
+
+    /** Reaps Steam API sessions whose Android port process was killed without SteamAPI_Shutdown. */
+    private synchronized void startPortProcessWatcher() {
+        if (portWatcherThread != null && portWatcherThread.isAlive()) return;
+        portWatcherRunning = true;
+        portWatcherThread = new Thread(() -> {
+            File registrations = new File(getFilesDir(), "port-processes");
+            while (portWatcherRunning && !isShuttingDown) {
+                File[] entries = registrations.listFiles();
+                if (entries != null) {
+                    for (File entry : entries) {
+                        if (!entry.isFile() || !entry.getName().matches("[0-9]+")) continue;
+                        try {
+                            long now = System.currentTimeMillis();
+                            if (now - entry.lastModified() < 2500L) continue;
+                            String[] data = readPortRegistration(entry);
+                            if (data == null) { entry.delete(); continue; }
+                            int pid = Integer.parseInt(entry.getName());
+                            long liveStart = processStartTime(pid);
+                            long registeredStart = Long.parseLong(data[1]);
+                            if (liveStart < 0 && new File("/proc/" + pid).exists()) continue;
+                            if (liveStart == registeredStart) continue;
+                            if (findSteamPid() <= 0) continue;
+                            Log.i(TAG, "Reaping exited port process pid=" + pid + " appid=" + data[0]);
+                            entry.setLastModified(now);
+                            String appid = data[0];
+                            String result = runInProot("SteamAppId=" + appid + " SteamGameId=" + appid
+                                    + " timeout 5 /usr/local/bin/steamstate /root/steamrtarm64 " + appid, 7);
+                            if (result != null && result.contains("\"ok\":true")) {
+                                Log.i(TAG, "Port session released appid=" + appid + " without restarting Steam");
+                                entry.delete();
+                            } else {
+                                Log.w(TAG, "Port session release pending appid=" + appid + " helper result unavailable");
+                            }
+                        } catch (Exception e) {
+                            Log.w(TAG, "Port process watcher error: " + e.getMessage());
+                        }
+                    }
+                }
+                try { Thread.sleep(1000L); } catch (InterruptedException ignored) {}
+            }
+        }, "port-process-watcher");
+        portWatcherThread.setDaemon(true);
+        portWatcherThread.start();
+    }
+
+    private String[] readPortRegistration(File file) {
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+            String[] fields = reader.readLine().trim().split("\\s+");
+            if (fields.length != 2 || !fields[0].matches("[0-9]{1,10}") || !fields[1].matches("[0-9]+")) return null;
+            return fields;
+        } catch (Exception ignored) { return null; }
+    }
+
+    /** Linux /proc stat field 22 is process start time; parsing after the final ')' handles spaces in comm. */
+    private long processStartTime(int pid) {
+        try (BufferedReader reader = new BufferedReader(new FileReader("/proc/" + pid + "/stat"))) {
+            String line = reader.readLine();
+            int end = line == null ? -1 : line.lastIndexOf(')');
+            if (end < 0) return -1L;
+            String[] fields = line.substring(end + 2).trim().split("\\s+");
+            return fields.length > 19 ? Long.parseLong(fields[19]) : -1L;
+        } catch (Exception ignored) { return -1L; }
     }
 
     private void startForegroundInternal(String text) {
@@ -2444,6 +2511,8 @@ public class SteamRuntimeService extends Service {
 
     @Override
     public void onDestroy() {
+        portWatcherRunning = false;
+        if (portWatcherThread != null) portWatcherThread.interrupt();
         performFullShutdown();
         sInstance = null;
         super.onDestroy();

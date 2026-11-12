@@ -42,8 +42,9 @@ in it as a resident daemon; you log in once through an in-app X display. The cli
   ARM64 stubs forwarding to the real library.
 - `shim.c` spoofs `getuid()`/`geteuid()` to 0 (matching the daemon's fake root, so the client asks for `u0-...`
   IPC), redirects `open`/`openat`/`shm_open` for `ValveIPCSharedObj-Steam` to the host's IPC path, answers the
-  `lepton.steamclient.path` system property, writes `steam_appid.txt`, and wraps init/shutdown so repeated
-  init cycles are safe.
+  `lepton.steamclient.path` system property, writes `steam_appid.txt`, registers its Android PID and AppID with
+  the host, and wraps init/shutdown so repeated init cycles are safe. The host reaps registrations when a port
+  process disappears and releases that AppID through Steam IPC without restarting Steam.
 - It applies small in-memory patches to the Valve client library so a separate process can attach to the host's
   Steam client. The patch data (offsets and instruction words) is **not in this repo**: it is read at runtime from a
   private `steamclient_patches.conf` that you create for your exact library build (`docs/PATCH_CONF.md`). Without it the

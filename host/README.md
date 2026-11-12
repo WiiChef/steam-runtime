@@ -26,6 +26,11 @@ It is a modified [Termux:X11](https://github.com/termux/termux-x11) (GPLv3), so 
 - Ports run in a **separate APK** with the same `android:sharedUserId` and signing key so they can read the host's
   `files/ipc`. Ports never run inside the container.
 
+The shim records each attached port's Android PID, `/proc` start time, and AppID under `files/port-processes/`.
+The foreground service checks those records once per second. When a PID exits or is reused, it runs the bounded
+`steamstate` attach/release helper inside PRoot with that AppID, which clears Steam's running-game state while the
+logged-in Steam process remains alive. A normal `SteamAPI_Shutdown` explicitly releases its user and pipe too.
+
 ## Status: client build and login state
 
 `status.json` (written by `SteamStatusExtras`, same in `overlay/` and `overlay-quest/`) additionally contains:

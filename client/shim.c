@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <android/log.h>
@@ -34,6 +35,7 @@
 static void install_steam_lifecycle_hooks(void);
 
 int SteamInternal_SteamAPI_Init(const char *version, char *err);
+void *SteamInternal_CreateInterface(const char *ver);
 
 static void *real_handle(void) {
     static void *h = NULL;
@@ -369,6 +371,31 @@ static void *g_real_release_pipe = NULL;
 static void *g_steam_client_self = NULL;
 static int g_steam_user = 0;
 static int g_steam_pipe = 0;
+static char g_steam_appid[16] = APPID;
+
+static void register_port_process(void) {
+    const char *dir = "/data/user/0/com.steamruntime.dev/files/port-processes";
+    char stat_path[64], out_path[256], stat_buf[4096];
+    FILE *f;
+    snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", (int)getpid());
+    f = fopen(stat_path, "r");
+    if (!f) return;
+    if (!fgets(stat_buf, sizeof(stat_buf), f)) { fclose(f); return; }
+    fclose(f);
+    char *close = strrchr(stat_buf, ')');
+    if (!close) return;
+    char *save = NULL;
+    char *tok = strtok_r(close + 2, " ", &save); /* field 3: state */
+    for (int field = 3; tok && field < 22; field++) tok = strtok_r(NULL, " ", &save);
+    if (!tok) return;
+    if (mkdir(dir, 0771) != 0 && access(dir, W_OK) != 0) return;
+    snprintf(out_path, sizeof(out_path), "%s/%d", dir, (int)getpid());
+    f = fopen(out_path, "w");
+    if (!f) return;
+    fprintf(f, "%s %s\n", g_steam_appid, tok);
+    fclose(f);
+    LOGI("Registered port process pid=%d appid=%s", (int)getpid(), g_steam_appid);
+}
 extern void *p_SteamAPI_Shutdown;
 extern void *p_SteamAPI_ISteamClient_ReleaseUser;
 extern void *p_SteamAPI_ISteamClient_BReleaseSteamPipe;
@@ -439,8 +466,12 @@ int SteamInternal_SteamAPI_Init(const char *version, char *err) {
     pthread_mutex_unlock(&g_steam_lifecycle_lock);
     LOGI("SteamAPI_Init request #%u pid=%d version=%s already_initialized=%d", n, (int)getpid(), version ? version : "NULL", already_initialized);
     if (already_initialized) return 0;
-    setenv("SteamAppId", APPID, 1);
-    setenv("SteamGameId", APPID, 1);
+    const char *requested_appid = getenv("SteamAppId");
+    if (!requested_appid || !requested_appid[0] || strlen(requested_appid) >= sizeof(g_steam_appid) ||
+        strspn(requested_appid, "0123456789") != strlen(requested_appid)) requested_appid = APPID;
+    snprintf(g_steam_appid, sizeof(g_steam_appid), "%s", requested_appid);
+    setenv("SteamAppId", g_steam_appid, 1);
+    setenv("SteamGameId", g_steam_appid, 1);
 
     if (check_build_guard()) {
         // Do not patch and do not attach: fail cleanly instead of crashing inside libsteamclient.so.
@@ -469,6 +500,16 @@ int SteamInternal_SteamAPI_Init(const char *version, char *err) {
         pthread_mutex_lock(&g_steam_lifecycle_lock);
         g_steam_initialized = 1;
         pthread_mutex_unlock(&g_steam_lifecycle_lock);
+        /* Steamworks.NET may use FindOrCreateUserInterface directly and never
+         * call the flat getters that normally record the SteamClient pointer. */
+        if (!g_steam_client_self) {
+            void *client = SteamInternal_CreateInterface("SteamClient021");
+            if (client) {
+                g_steam_client_self = client;
+                LOGI("Captured SteamClient interface for lifecycle release: %p", client);
+            }
+        }
+        register_port_process();
     }
     LOGI("SteamAPI_Init real call #%u returned=%d pid=%d err=%s", real_n, r, (int)getpid(), local_err);
     if (err && local_err[0]) {
