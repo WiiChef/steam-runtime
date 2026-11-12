@@ -44,3 +44,16 @@ Before patching and in `SteamAPI_Init`, the shim compares the two:
 
 If the file is missing or empty the shim loads and forwards calls but applies no patches, so it will not attach
 to the host.
+
+## Generating a conf from a port shim with built-in patches
+
+Older port shims (e.g. the ATO port's `steamshim/src/shim.c`) carry the patch table in code. Convert it, checked
+against the exact `libsteamclient.so` your port bundles, with:
+
+```
+python examples/steamtest/tools/convert_ato_patches.py <port shim.c> <libsteamclient.so> <out.conf> --client-build <host client_build>
+```
+
+Push the result to the host's files dir (`adb push` to `/data/local/tmp`, then
+`run-as com.steamruntime.dev cp /data/local/tmp/steamclient_patches.conf files/`). Keep the output private: it is not
+committed.

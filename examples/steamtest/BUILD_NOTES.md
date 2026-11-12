@@ -33,3 +33,16 @@ produces) into work/steamtest/prebuilt/.
 - libs in new APK == original list exactly (8 .so files, same names)
 - apksigner verify: OK (signed with C:\Android\debug.keystore, CN=Android Debug)
 - Compile: only 1 warning (pointer-bool-conversion at sns_test.cpp:338), no errors; no source fixes needed.
+
+## Shim build (2026-11-11)
+- The APK bundles OUR shim (client/shim.c) as `libsteam_api.so` and Valve's library as `libsteam_api_real.so`;
+  Valve libs come from `prebuilt/` (extract them from an installed port APK; never commit them).
+- Headers: `tools/env.ps1` sets `STEAMWORKS_HEADERS` (checks `C:\steamworks-sdk\sdk\public`, then
+  `D:\tmp\steamworks_headers`); set it yourself if your SDK lives elsewhere.
+- Build: `. .\tools\env.ps1; python build_apk.py` -> `build/SteamTest.apk` (package `com.sts2.steamtest.guard`,
+  sharedUserId `com.steamruntime.shared`; must be signed with the same key as the installed host).
+- Headless test: `adb shell am start -n com.sts2.steamtest.guard/com.sts2.steamtest.SteamTest --es cmd init`, then
+  `adb logcat -s StS2Shim SteamTest`. On Quest the headset must be awake (`am broadcast -a
+  com.oculus.vrpowermanager.prox_close`; undo with `...automation_disable`), otherwise launches are ignored.
+- Verified on Quest 3, host client 1788652215: guard match -> `SteamAPI_InitEx returned OK`, `logged_on=1`;
+  `client_build=0000000` -> `Steam client build mismatch ...`, init code 1, no crash.

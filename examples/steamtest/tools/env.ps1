@@ -15,3 +15,11 @@ $env:PATH = ("{0}\bin;{1};{2}\{3};{4}\toolchains\llvm\prebuilt\windows-x86_64\bi
 Write-Host "JAVA_HOME=$env:JAVA_HOME"
 Write-Host "ANDROID_HOME=$env:ANDROID_HOME (build-tools: $($bt.Name))"
 Write-Host "ANDROID_NDK_HOME=$env:ANDROID_NDK_HOME"
+
+# Steamworks SDK headers (steam/steam_api.h). Set STEAMWORKS_HEADERS before dot-sourcing to override.
+if (-not $env:STEAMWORKS_HEADERS) {
+    foreach ($p in "C:\steamworks-sdk\sdk\public", "D:\tmp\steamworks_headers") {
+        if (Test-Path "$p\steam\steam_api.h") { $env:STEAMWORKS_HEADERS = $p; break }
+    }
+}
+if (-not $env:STEAMWORKS_HEADERS) { Write-Warning "STEAMWORKS_HEADERS not set: point it at a folder containing steam\steam_api.h" }
