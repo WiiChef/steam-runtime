@@ -66,12 +66,15 @@ final class SteamStatusExtras {
     static String[] readClientBuild(File rootfsDir) {
         File steamDir = new File(rootfsDir, "root/steamrtarm64");
         String best = "";
-        File[] manifests = new File(steamDir, "package").listFiles(
-                (d, n) -> n.startsWith("steam_client_") && n.endsWith(".manifest"));
-        if (manifests != null) {
-            for (File m : manifests) {
-                String v = manifestVersion(m);
-                if (v.length() > best.length() || (v.length() == best.length() && v.compareTo(best) > 0)) best = v;
+        File[] packageDirs = {new File(rootfsDir, "root/package"), new File(steamDir, "package")};
+        for (File packageDir : packageDirs) {
+            File[] manifests = packageDir.listFiles(
+                    (d, n) -> n.startsWith("steam_client_") && n.endsWith(".manifest"));
+            if (manifests != null) {
+                for (File m : manifests) {
+                    String v = manifestVersion(m);
+                    if (v.length() > best.length() || (v.length() == best.length() && v.compareTo(best) > 0)) best = v;
+                }
             }
         }
         String date = firstLine(new File(steamDir, "builddate.txt"));

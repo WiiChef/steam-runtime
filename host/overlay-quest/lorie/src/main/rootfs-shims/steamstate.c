@@ -67,7 +67,7 @@ static void *load_client(const char *dir) {
 }
 
 int main(int argc, char **argv) {
-    unsigned appids[MAX_APPS];
+    unsigned appids[MAX_APPS] = {0};
     int owned[MAX_APPS] = {0};
     int napps = 0;
     for (int i = 2; i < argc && napps < MAX_APPS; i++) {
