@@ -33,18 +33,28 @@
 
 static void install_steam_lifecycle_hooks(void);
 
+int SteamInternal_SteamAPI_Init(const char *version, char *err);
+
 static void *real_handle(void) {
     static void *h = NULL;
     if (!h) {
-        h = dlopen("libsteam_api.so", RTLD_NOW | RTLD_GLOBAL);
-        if (!h) {
-            h = dlopen("./libsteam_api.so", RTLD_NOW | RTLD_GLOBAL);
+        // Valve's library is bundled as libsteam_api_real.so; libsteam_api.so is normally this shim.
+        // Older ports bundled the shim under another name, so libsteam_api.so is still tried, but
+        // never accepted when it resolves to this shim (that would forward every call to itself).
+        static const char *names[] = { "libsteam_api_real.so", "./libsteam_api_real.so",
+                                       "libsteam_api.so", "./libsteam_api.so" };
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !h; i++) {
+            void *c = dlopen(names[i], RTLD_NOW | RTLD_GLOBAL);
+            if (!c) continue;
+            void *sym = dlsym(c, "SteamInternal_SteamAPI_Init");
+            if (sym == (void *)&SteamInternal_SteamAPI_Init) {
+                LOGW("%s resolves to this shim; skipping", names[i]);
+                continue;
+            }
+            h = c;
+            LOGI("real Steam API library %s dlopened: %p", names[i], h);
         }
-        if (h) {
-            LOGI("libsteam_api.so dlopened successfully: %p", h);
-        } else {
-            LOGE("Failed to dlopen libsteam_api.so: %s", dlerror());
-        }
+        if (!h) LOGE("Failed to dlopen Valve's libsteam_api_real.so: %s", dlerror());
     }
     return h;
 }
