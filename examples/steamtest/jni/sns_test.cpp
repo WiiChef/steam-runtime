@@ -17,11 +17,16 @@
 #define __COUNTER__ 0
 #endif
 #include "steam/steam_api.h"
+#include "steam/steam_api_flat.h"
 #include <jni.h>
 #define SNSLOG(fmt, ...) __android_log_print(ANDROID_LOG_INFO, "SNSTEST", fmt, ##__VA_ARGS__)
 #endif
 
 namespace {
+
+static void release_networking_message(SteamNetworkingMessage_t& msg) {
+    if (msg.m_pfnRelease) msg.m_pfnRelease(&msg);
+}
 
 const int kVirtualPort = 7;
 const uint32_t kPayloadSize = 4096;
@@ -267,7 +272,7 @@ void SnsTest::Start(int role) {
         m_state = St_WaitLobbyCreated;
     } else {
         // CLIENT: ensure relay network access is initialized before any P2P connect
-        SteamNetworkingUtils()->InitRelayNetworkAccess();
+        SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess(SteamNetworkingUtils());
         // CLIENT: filter and request lobby list
         SteamMatchmaking()->AddRequestLobbyListStringFilter(kLobbyKeyTest, "1", k_ELobbyComparisonEqual);
         SteamAPICall_t call = SteamMatchmaking()->RequestLobbyList();
@@ -287,7 +292,7 @@ void SnsTest::BeginConnectToHost(uint64_t hostSteamId64) {
     m_hostSteamId64 = hostSteamId64;
     LogEvent("direct_target", "host=" + std::to_string(m_hostSteamId64));
     SteamNetworkingIdentity identity;
-    identity.SetSteamID64(m_hostSteamId64);
+    SteamAPI_SteamNetworkingIdentity_SetSteamID64(&identity, m_hostSteamId64);
     m_conn = SteamNetworkingSockets()->ConnectP2P(identity, kVirtualPort, 0, nullptr);
     LogEvent("connect_start", "conn=" + std::to_string((uint64_t)m_conn));
     m_connectDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
@@ -363,7 +368,7 @@ void SnsTest::OnConnStatus(SteamNetConnectionStatusChangedCallback_t *p) {
             if (m_role == 0 && p->m_hConn != k_HSteamNetConnection_Invalid) {
                 if (m_listenSocket != k_HSteamListenSocket_Invalid &&
                     p->m_info.m_hListenSocket == m_listenSocket &&
-                    p->m_info.m_identityRemote.GetSteamID64() != 0) {
+                    SteamAPI_SteamNetworkingIdentity_GetSteamID64(&p->m_info.m_identityRemote) != 0) {
                     SteamNetworkingSockets()->AcceptConnection(p->m_hConn);
                     LogEvent("accepted", "conn=" + std::to_string((uint64_t)p->m_hConn));
                     m_conn = p->m_hConn;
@@ -415,7 +420,7 @@ void SnsTest::PumpReceive() {
     for (int i = 0; i < n; ++i) {
         SteamNetworkingMessage_t &msg = *msgs[i];
         if (msg.m_cbSize == 4 && memcmp(msg.m_pData, "DONE", 4) == 0) {
-            msg.Release();
+            release_networking_message(msg);
             if (m_role == 0) {
                 m_doneReceived = true;
                 CloseConn(1000, "sns_test_ok");
@@ -424,7 +429,7 @@ void SnsTest::PumpReceive() {
             continue;
         }
         m_recvBuf.append(static_cast<char *>(msg.m_pData), msg.m_cbSize);
-        msg.Release();
+        release_networking_message(msg);
         if (m_recvBuf.size() == kPayloadSize) {
             std::string got = std::move(m_recvBuf);
             m_recvBuf.clear();

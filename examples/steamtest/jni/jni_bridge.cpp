@@ -27,6 +27,7 @@
 #define LOG_TAG "SteamTest"
 #define LOGI(...) do { __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__); AddLog(__VA_ARGS__); } while(0)
 #define LOGE(...) do { __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__); AddLog(__VA_ARGS__); } while(0)
+#define LOGW(...) do { __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__); AddLog(__VA_ARGS__); } while(0)
 
 // Thread-safe log message queue
 static std::mutex g_logMutex;
@@ -523,6 +524,13 @@ Java_com_sts2_steamtest_SteamTest_nativeInit(JNIEnv*, jclass, jint appId) {
 
     if (r == k_ESteamAPIInitResult_OK) {
         LOGI("[+] SteamAPI_InitEx returned OK (0)!");
+        SteamAPI_RunCallbacks();
+        ISteamUser* attachedUser = SteamUser();
+        ISteamFriends* attachedFriends = SteamFriends();
+        const char* persona = attachedFriends ? attachedFriends->GetPersonaName() : nullptr;
+        LOGI("[STEAM ATTACH] logged_on=%d persona=%s",
+             attachedUser && attachedUser->BLoggedOn() ? 1 : 0,
+             persona && persona[0] ? persona : "(unknown)");
         if (!g_mgr) {
             g_mgr = new SteamDiagnosticsManager();
         }
@@ -550,10 +558,6 @@ Java_com_sts2_steamtest_SteamTest_nativeGetStatus(JNIEnv* env, jclass) {
         if (user) {
             bool logged = user->BLoggedOn();
             ss << ";logged_on=" << (logged ? "1" : "0");
-            if (logged) {
-                CSteamID id = user->GetSteamID();
-                ss << ";steam_id=" << id.ConvertToUint64();
-            }
         }
         if (friends) {
             const char* persona = friends->GetPersonaName();

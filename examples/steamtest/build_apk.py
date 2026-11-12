@@ -3,19 +3,17 @@ import sys
 import shutil
 import subprocess
 import zipfile
-def _env_or(name, *fallbacks):
-    v = os.environ.get(name)
-    if v and os.path.isdir(v):
-        return v
-    for f in fallbacks:
-        if os.path.exists(f):
-            return f
-    raise FileNotFoundError(name + " not set and no fallback found: " + ", ".join(fallbacks))
+def _env_or(*options):
+    for option in options:
+        candidate = os.environ.get(option) if option.isidentifier() and option.upper() == option else option
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    raise FileNotFoundError("No configured path found: " + ", ".join(options))
 
 WORK = os.path.dirname(os.path.abspath(__file__))
-SDK = _env_or("ANDROID_HOME", "ANDROID_SDK_ROOT", r"C:\Android\sdk")
-NDK = _env_or("ANDROID_NDK_HOME", r"C:\Android\ndk\r28c")
-JDK = _env_or("JAVA_HOME", r"C:\Java\jdk-17")
+SDK = _env_or("ANDROID_HOME", "ANDROID_SDK_ROOT", r"C:\Android\sdk", r"D:\tools\sdk")
+NDK = _env_or("ANDROID_NDK_HOME", r"C:\Android\ndk\r28c", r"D:\tools\android-ndk-r28c")
+JDK = _env_or("JAVA_HOME", r"C:\Java\jdk-17", r"D:\tools\jdk17\jdk-17.0.19+10")
 _bt = os.path.join(SDK, "build-tools")
 BT = sorted(os.path.join(_bt, d) for d in os.listdir(_bt) if os.path.isdir(os.path.join(_bt, d)))[-1]
 PLAT = os.path.join(SDK, "platforms", "android-35", "android.jar")
@@ -24,14 +22,16 @@ JDK_BIN = os.path.join(JDK, "bin")
 AAPT2 = os.path.join(BT, "aapt2.exe")
 ZIPALIGN = os.path.join(BT, "zipalign.exe")
 APKSIGNER = os.path.join(BT, "apksigner.bat")
-KEYSTORE = r"C:\Android\debug.keystore"
+KEYSTORE = os.environ.get("KEYSTORE") or r"D:\tools\debug.keystore"
+if not os.path.exists(KEYSTORE) and os.path.exists(r"C:\Android\debug.keystore"):
+    KEYSTORE = r"C:\Android\debug.keystore"
 
-STEAM_LIB = os.environ.get("STEAM_LIB") or r"C:\steamworks-sdk\sdk\redistributable_bin\androidarm64\libsteam_api.so"
+STEAM_LIB = os.environ.get("STEAM_LIB") or os.path.join(WORK, "prebuilt", "libsteam_api_real.so")
 if not os.path.exists(STEAM_LIB):
-    STEAM_LIB = os.path.join(WORK, "prebuilt", "libsteam_api.so")
+    STEAM_LIB = os.path.join(WORK, "prebuilt", "libsteam_api_real.so")
 os.environ.setdefault("STEAMWORKS_HEADERS", r"C:\steamworks-sdk\sdk\public")
 SO_DIR = os.path.join(WORK, "prebuilt")  # Valve libs extracted from original SteamTest-signed.apk
-LIBCXX = os.path.join(NDK, "toolchains", "llvm", "prebuilt", "windows-x86_64", "sysroot", "usr", "lib", "aarch64-linux-android", "libc++_shared.so")
+LIBCXX = os.path.join(SO_DIR, "libc++_shared.so")
 
 SRC = WORK
 OUT = os.path.join(SRC, "build")
@@ -64,17 +64,17 @@ def main():
         "-DANDROID_PLATFORM=android-29",
         "-DANDROID_STL=c++_shared",
         "-DCMAKE_BUILD_TYPE=Release",
-        f"-DSTEAMWORKS_LIB={STEAM_LIB}",
     ]
     run(cmake_cmd)
     run(["ninja"], cwd=NATIVE_DIR)
 
     # Copy native libraries
     shutil.copy(os.path.join(NATIVE_DIR, "libsteamtest.so"), APK_LIB_DIR)
-    shutil.copy(STEAM_LIB, os.path.join(APK_LIB_DIR, "libsteam_api.so"))
+    shutil.copy(os.path.join(NATIVE_DIR, "libsteam_api.so"), APK_LIB_DIR)
+    shutil.copy(STEAM_LIB, os.path.join(APK_LIB_DIR, "libsteam_api_real.so"))
     shutil.copy(LIBCXX, APK_LIB_DIR)
     for f in os.listdir(SO_DIR):
-        if f.endswith(".so"):
+        if f.endswith(".so") and f != "libsteam_api_real.so":
             shutil.copy(os.path.join(SO_DIR, f), APK_LIB_DIR)
     print(f"  Copied {len(os.listdir(APK_LIB_DIR))} native libraries to {APK_LIB_DIR}")
 
