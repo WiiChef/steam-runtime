@@ -21,7 +21,7 @@ public final class PortAutoCloud {
     private static final Pattern FIELD = Pattern.compile("\"([^\"]+)\"\\s*\"([^\"]*)\"");
     static final long STABILITY_MS = 250;
     static final long TIME_MARGIN = 120;
-    static final long MAX_SKEW = 24 * 60 * 60;
+    static final int MAX_EXIT_ATTEMPTS = 3;
 
     interface LockedTask<T> { T run() throws Exception; }
 
@@ -42,11 +42,62 @@ public final class PortAutoCloud {
     static void afterExit(File host, int appid, BooleanSupplier live, LockedTask<?> reconcile,
                           LockedTask<?> release) throws Exception {
         withLifecycleLock(host, appid, () -> {
-            if (live.getAsBoolean()) return null;
-            reconcile.run();
-            if (!live.getAsBoolean()) release.run();
+            File retries = new File(host, "autocloud/" + appid + "-exit-retries");
+            if (live.getAsBoolean()) { retries.delete(); return null; }
+            Object result;
+            try { result = reconcile.run(); }
+            catch (Exception e) { result = new JSONObject().put("ok", false).put("error", e.toString()); }
+            if (live.getAsBoolean()) { retries.delete(); return null; }
+            if (result instanceof JSONObject && needsRetry((JSONObject) result)) {
+                int attempt = retries.isFile() ? Integer.parseInt(read(retries).trim()) + 1 : 1;
+                if (attempt < MAX_EXIT_ATTEMPTS) {
+                    write(retries, Integer.toString(attempt).getBytes(StandardCharsets.UTF_8), System.currentTimeMillis() / 1000L);
+                    Log.w("PortAutoCloud", "After-exit blocked; retaining session and registration for retry " + attempt);
+                    return null;
+                }
+                Log.w("PortAutoCloud", "After-exit retry limit reached; releasing session with saves retained");
+            }
+            if (!live.getAsBoolean()) { release.run(); retries.delete(); }
             return null;
         });
+    }
+
+    static boolean needsRetry(JSONObject report) {
+        if (!report.optBoolean("ok", false)) return true;
+        JSONArray rows = report.optJSONArray("files");
+        if (rows != null) for (int i = 0; i < rows.length(); i++) {
+            JSONObject row = rows.optJSONObject(i);
+            if (row != null && string(row, "action", "").startsWith("blocked;")) return true;
+        }
+        return false;
+    }
+
+    // Android optString returns the literal "null" for JSONObject.NULL. Accept legacy
+    // state files, but never create JSON null hash fields in new state records.
+    private static String string(JSONObject object, String key, String fallback) {
+        return object.isNull(key) ? fallback : object.optString(key, fallback);
+    }
+
+    private static boolean reconciled(JSONObject previous) {
+        return previous != null && (previous.optBoolean("reconciled") || previous.has("local_sha"));
+    }
+
+    static void writeStatusSnapshot(File target, String json) throws IOException {
+        // Host tests run on Windows, where a reader can briefly deny rename sharing.
+        for (int attempt = 0; ; attempt++) {
+            try {
+                write(target, json.getBytes(StandardCharsets.UTF_8), System.currentTimeMillis() / 1000L);
+                target.setReadable(true, false);
+                return;
+            } catch (AccessDeniedException e) {
+                if (attempt >= 4) throw e;
+                try { Thread.sleep(10); }
+                catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted writing status", interrupted);
+                }
+            }
+        }
     }
 
     private static String read(File f) throws IOException {
@@ -204,40 +255,40 @@ public final class PortAutoCloud {
         // A durable deletion intent may precede removal of the old mirror bytes.
         // Only those exact bytes belong to the deletion we staged.
         if (previous != null && previous.has("deleted_cloud_sha") && previous.isNull("cloud_sha") &&
-            Objects.equals(cloud, previous.optString("deleted_cloud_sha"))) cloud = null;
+            Objects.equals(cloud, string(previous, "deleted_cloud_sha", null))) cloud = null;
         if (local == null) {
             if (previous != null) {
                 // App-wide ChangeNumber cannot identify a change to this file.
                 // Unreconciled history compares against the last validated local bytes.
-                String baseline = previous.has("cloud_sha") ? previous.optString("cloud_sha", null) :
-                    previous.optString("seen_local_sha", previous.optString("local_sha", null));
-                boolean cloudChanged = cloud != null && (previous.has("cloud_sha") || baseline != null) &&
+                String baseline = reconciled(previous) || previous.has("cloud_sha") ? string(previous, "cloud_sha", null) :
+                    string(previous, "seen_local_sha", string(previous, "local_sha", null));
+                boolean cloudChanged = cloud != null && (reconciled(previous) || previous.has("cloud_sha") || baseline != null) &&
                     !cloud.equals(baseline);
                 if (!cloudChanged) return "local deletion";
             }
-            return ct > now || ct < 0 ? "clock conflict" : "download";
+            return ct > now || ct < 0 ? "clock conflict" : (cloud == null ? "content conflict" : "download");
         }
         if (local.equals(cloud)) return "identical";
         if (qt > now || ct > now || qt < 0 || ct < 0) return "clock conflict";
-        if (previous != null && previous.has("local_sha")) {
-            boolean localChanged = !local.equals(previous.optString("local_sha"));
-            String previousCloud = previous.isNull("cloud_sha") ? null : previous.optString("cloud_sha");
+        if (reconciled(previous)) {
+            boolean localChanged = !local.equals(string(previous, "local_sha", null));
+            String previousCloud = string(previous, "cloud_sha", null);
             boolean cloudChanged = !Objects.equals(cloud, previousCloud);
             if (localChanged && cloudChanged) return "content conflict";
-            if (cloudChanged) return "download";
+            if (cloudChanged) return cloud == null ? "content conflict" : "download";
             if (localChanged) return upload ? "upload" : "upload disabled";
             return "pending Steam acknowledgement";
         }
         if (cloud == null) return upload ? "upload" : "upload disabled";
         long delta = qt - ct;
-        if (Math.abs(delta) > MAX_SKEW || Math.abs(delta) <= TIME_MARGIN) return "clock conflict";
+        if (Math.abs(delta) <= TIME_MARGIN) return "clock conflict";
         return delta < 0 ? "download" : (upload ? "upload" : "upload disabled");
     }
 
     // RunHistoryDataJson.RunEntry embeds the full submitted RunAggregateData as JSON.
     // For single-player runs this is recorded on end/abandon, before the local save is removed.
     private static Save completedRunHistory(File quest, Save cloud) throws Exception {
-        String id = new JSONObject(new String(cloud.bytes, StandardCharsets.UTF_8)).optString("id");
+        String id = string(new JSONObject(new String(cloud.bytes, StandardCharsets.UTF_8)), "id", "");
         File file = safe(quest, "run-history/RunHistory.json");
         if (id.isEmpty() || !file.isFile()) return null;
         Save history = new Save(file);
@@ -245,9 +296,9 @@ public final class PortAutoCloud {
         if (entries == null) return null;
         for (int i = 0; i < entries.length(); i++) {
             JSONObject entry = entries.optJSONObject(i);
-            if (entry == null || !id.equals(entry.optString("runId")) || !entry.optBoolean("isFull")) continue;
+            if (entry == null || !id.equals(string(entry, "runId", "")) || !entry.optBoolean("isFull")) continue;
             JSONObject run = new JSONObject(entry.getString("runDataJson"));
-            if (id.equals(run.optString("id")) && run.optBoolean("isFull") &&
+            if (id.equals(string(run, "id", "")) && run.optBoolean("isFull") &&
                 run.has("endless") && !run.getBoolean("endless")) return history;
         }
         return null;
@@ -270,10 +321,11 @@ public final class PortAutoCloud {
         File dir = new File(host, "autocloud");
         try {
             long now = System.currentTimeMillis() / 1000L;
-            report.put("appid", appid).put("phase", phase).put("created", now).put("files", rows);
+            if ("before-start".equals(phase)) new File(dir, appid + "-exit-retries").delete();
+            report.put("start_allowed", true).put("appid", appid).put("phase", phase).put("created", now).put("files", rows);
             if (appid != 2742830) throw new IOException("No cloud mapping for this AppID");
             JSONObject status = new JSONObject(read(new File(host, "status.json")));
-            boolean online = status.optBoolean("logged_on", false) && "Logged On".equals(status.optString("steam_login_state"));
+            boolean online = status.optBoolean("logged_on", false) && "Logged On".equals(string(status, "steam_login_state", ""));
             report.put("cloud_online", online);
             File steam = new File(host, "rootfs/debian-trixie-aarch64/root/steamrtarm64");
             File[] users = new File(steam, "userdata").listFiles();
@@ -327,9 +379,16 @@ public final class PortAutoCloud {
                     if (meta == null && cloud.exists()) {
                         row.put("action", "blocked; untracked mirror file awaits Steam inventory"); continue;
                     }
-                    // Missing mirror entries (including Steam tombstones) are isolated per file.
-                    // syncstate values are undocumented, so never infer deletion from a numeric value alone.
-                    if (meta != null && (!cloud.isFile() || "2".equals(meta.get("persiststate"))) && !local.isFile()) {
+                    boolean deleted = meta != null && "2".equals(meta.get("persiststate"));
+                    if (meta != null && !deleted && !cloud.isFile()) {
+                        row.put("action", "blocked; cloud not materialized");
+                        Log.w("PortAutoCloud", "cloud not materialized: " + name);
+                        if ("before-start".equals(phase) && name.endsWith("metagameSave.json"))
+                            report.put("start_allowed", false);
+                        continue;
+                    }
+                    if (deleted && (!local.isFile() ||
+                            (!name.equals("saves/save-singlePlayer.json") && !reconciled(history.optJSONObject(name))))) {
                         row.put("action", "skipped deleted/absent cloud entry"); continue;
                     }
                     // Record existence before validating or changing bytes. An invalid save must
@@ -344,7 +403,7 @@ public final class PortAutoCloud {
                         previous.put("seen_local_sha", localSave.sha);
                         write(stateFile, state.toString(2).getBytes(StandardCharsets.UTF_8), now);
                     }
-                    Save remoteSave = meta == null || !cloud.isFile() ? null : new Save(cloud);
+                    Save remoteSave = meta == null || deleted || !cloud.isFile() ? null : new Save(cloud);
                     if (remoteSave != null && !remoteSave.sha.equalsIgnoreCase(meta.get("sha")))
                         throw new IOException("Cloud cache hash mismatch");
                     long qt = localSave == null ? 0 : localSave.modified / 1000L;
@@ -359,8 +418,7 @@ public final class PortAutoCloud {
                         row.put("action", "local deletion retained; cloud deletion not staged");
                         // All other missing files retain delete-and-rename crash protection.
                         if (upload && name.equals("saves/save-singlePlayer.json") && remoteSave != null &&
-                            previous != null && remoteSave.sha.equals(previous.optString("cloud_sha",
-                                previous.optString("deleted_cloud_sha"))) &&
+                            previous != null && remoteSave.sha.equals(string(previous, "cloud_sha", string(previous, "deleted_cloud_sha", null))) &&
                             ct >= 0 && ct <= now) {
                             Save completion = completedRunHistory(quest, remoteSave);
                             if (completion != null) {
@@ -416,7 +474,7 @@ public final class PortAutoCloud {
                     Log.w("PortAutoCloud", "File reconciliation blocked; " + e.getMessage());
                 }
             }
-            report.put("ok", online);
+            report.put("ok", online && report.optBoolean("start_allowed", true));
         } catch (Exception e) {
             try { report.put("ok", false).put("error", e.getMessage()); } catch (JSONException ignored) { }
             Log.w("PortAutoCloud", "Sync blocked; " + e.getMessage());
@@ -427,8 +485,8 @@ public final class PortAutoCloud {
     }
 
     private static JSONObject record(String local, String cloud, String change, long ct) throws JSONException {
-        return new JSONObject().put("local_sha", local == null ? JSONObject.NULL : local)
-            .put("cloud_sha", cloud == null ? JSONObject.NULL : cloud)
+        return new JSONObject().put("reconciled", true).put("local_sha", local)
+            .put("cloud_sha", cloud)
             .put("cloud_change_number", change).put("cloud_time", ct);
     }
 }

@@ -118,7 +118,7 @@ public class SteamRuntimeService extends Service {
                                 () -> hasLivePortProcess(appid), () -> {
                                 Log.i(TAG, "Reaping exited port process pid=" + pid + " appid=" + appid);
                                 entry.setLastModified(now);
-                                if ("2742830".equals(appid)) PortAutoCloud.syncLocked(getFilesDir(), 2742830,
+                                if ("2742830".equals(appid)) return PortAutoCloud.syncLocked(getFilesDir(), 2742830,
                                     new File("/sdcard/Android/data/com.game.monstertrain2/files"), "after-exit");
                                 return null;
                             }, () -> {
@@ -551,10 +551,7 @@ public class SteamRuntimeService extends Service {
 
         try {
             File statusFile = new File(filesDir, "status.json");
-            FileWriter fw = new FileWriter(statusFile, false);
-            fw.write(json);
-            fw.close();
-            statusFile.setReadable(true, false);
+            PortAutoCloud.writeStatusSnapshot(statusFile, json);
             Log.i(TAG, "status.json updated:\n" + json.trim());
         } catch (Exception e) {
             Log.e(TAG, "Failed writing status.json: " + e.getMessage());

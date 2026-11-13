@@ -193,9 +193,11 @@ public class PortAutoCloudTest {
                     String action = f.action(f.sync(mode.equals("startup") ? "before-start" : "after-exit"), RUN);
                     String expected = mode.equals("PC changed") ? "content conflict" :
                         mode.equals("disabled") || mode.equals("startup") ? "upload disabled" : "upload";
-                    check(mode.equals("corrupt") ? action.startsWith("blocked;") : action.equals(expected), "unexpected action " + action);
+                    boolean missingLive = inventory.equals("old") && !mode.equals("PC changed");
+                    boolean lingeringDeleted = inventory.equals("deleted bytes") && mode.equals("upload");
+                    check(mode.equals("corrupt") || missingLive || lingeringDeleted ? action.startsWith("blocked;") : action.equals(expected), "unexpected action " + action);
                     check(get(f.local(RUN)).equals(mode.equals("corrupt") ? "{" : next), "Quest save changed");
-                    if (mode.equals("upload")) check(get(f.cloud(RUN)).equals(next), "new Quest run missing");
+                    if (mode.equals("upload") && !missingLive && !lingeringDeleted) check(get(f.cloud(RUN)).equals(next), "new Quest run missing");
                     else if (mode.equals("PC changed")) {
                         check(get(f.cloud(RUN)).equals(pc), "PC run overwritten");
                         check(new File(f.local(RUN).getPath() + ".conflict-" + (NOW - 20) + "-" + sha(pc).substring(0, 12)).isFile(), "PC conflict missing");
@@ -209,7 +211,7 @@ public class PortAutoCloudTest {
                 Files.delete(f.cloud(RUN).toPath());
                 if (dropped) { f.entries.remove(RUN); f.inventory(); }
                 put(f.local(RUN), NEW, NOW - 10);
-                check(f.action(f.sync("after-exit"), RUN).equals("content conflict"), "unexplained cloud deletion ignored");
+                check(f.action(f.sync("after-exit"), RUN).equals(dropped ? "content conflict" : "blocked; cloud not materialized"), "unexplained cloud deletion ignored");
                 check(!f.cloud(RUN).exists() && get(f.local(RUN)).equals(NEW), "conflicting deletion overwritten");
             });
         }
@@ -222,9 +224,8 @@ public class PortAutoCloudTest {
             check(!f.cloud(RUN).exists() && !f.local(RUN).exists(), "completed run survived");
             JSONObject tombstone = new JSONObject(get(new File(f.host, "autocloud/2742830-state.json")))
                 .getJSONObject("files").getJSONObject(RUN);
-            check(tombstone.has("local_sha") && tombstone.isNull("local_sha") && tombstone.has("cloud_sha") &&
-                tombstone.isNull("cloud_sha") && tombstone.getString("deleted_cloud_sha").equals(sha(finished)), "deletion tombstone missing");
-            check(f.action(f.sync("after-exit"), RUN).startsWith("skipped deleted/absent"), "deletion retry failed");
+            check(tombstone.optBoolean("reconciled") && !tombstone.has("local_sha") && !tombstone.has("cloud_sha") && tombstone.getString("deleted_cloud_sha").equals(sha(finished)), "deletion tombstone missing");
+            check(f.action(f.sync("after-exit"), RUN).equals("blocked; cloud not materialized"), "live inventory must await Steam acknowledgement");
             // Simulate interruption between durable intent and mirror removal.
             put(f.cloud(RUN), finished, NOW - 1000);
             check(f.action(f.sync("after-exit"), RUN).equals("completed run cloud deletion staged"), "deletion intent retry failed");
@@ -372,8 +373,8 @@ public class PortAutoCloudTest {
             check(f.action(f.sync("before-start"), RUN).equals("download"), "new cloud not downloaded");
             check(get(f.local(RUN)).equals(OLD), "wrong download");
         });
-        test("clock skew refuses time winner", () -> {
-            Fixture f = new Fixture(); f.remote(RUN, OLD, NOW - 1000); put(f.local(RUN), NEW, NOW - 200000); f.marker();
+        test("near simultaneous timestamps refuse time winner", () -> {
+            Fixture f = new Fixture(); f.remote(RUN, OLD, NOW - 1000); put(f.local(RUN), NEW, NOW - 1050); f.marker();
             check(f.action(f.sync("after-exit"), RUN).equals("clock conflict"), "skew allowed");
             check(get(f.local(RUN)).equals(NEW) && get(f.cloud(RUN)).equals(OLD), "skew overwrote save");
         });
@@ -520,7 +521,8 @@ public class PortAutoCloudTest {
         test("missing non-tombstone entry is isolated", () -> {
             Fixture f = new Fixture(); f.entry(META, sha(OLD), NOW - 1000, "0"); f.remote(RUN, NEW, NOW - 1000);
             JSONObject result = f.sync("before-start");
-            check(f.action(result, META).startsWith("skipped deleted/absent"), "missing file not skipped");
+            check(f.action(result, META).equals("blocked; cloud not materialized"), "missing live cloud not blocked");
+            check(!result.getBoolean("start_allowed") && !result.getBoolean("ok"), "startup danger not reported");
             check(get(f.local(RUN)).equals(NEW), "missing entry aborted other files");
         });
         test("startup cannot stage deletion", () -> {
@@ -618,6 +620,89 @@ public class PortAutoCloudTest {
             check(liveness.hasLiveProcess("2742830", "com.game.monstertrain2"), "initial directory grace");
             f.timeout();
             check(!liveness.hasLiveProcess("2742830", "com.game.monstertrain2"), "directory failure blocked forever");
+        });
+        test("Android JSON null semantics are active", () -> {
+            JSONObject object = new JSONObject().put("value", JSONObject.NULL);
+            check(object.optString("value", "fallback").equals("null"), "tests are not using Android org.json");
+        });
+        test("legacy Android null tombstone retries exact deleted run", () -> {
+            Fixture f = new Fixture(); f.remote(RUN, finished, NOW - 1000); f.marker();
+            put(f.local("run-history/RunHistory.json"), completedHistory, NOW - 100);
+            JSONObject previous = new JSONObject().put("local_sha", JSONObject.NULL).put("cloud_sha", JSONObject.NULL)
+                .put("deleted_cloud_sha", sha(finished));
+            put(new File(f.host, "autocloud/2742830-state.json"), new JSONObject().put("account", "123")
+                .put("files", new JSONObject().put(RUN, previous)).toString(), NOW);
+            check(f.action(f.sync("after-exit"), RUN).equals("completed run cloud deletion staged"), "legacy null fallback lost deleted hash");
+            check(!f.cloud(RUN).exists(), "deleted run survived retry");
+        });
+        for (boolean reconciled : new boolean[] {false, true}) {
+            test("live missing metagame cannot upload fresh save " + reconciled, () -> {
+                Fixture f = new Fixture(); f.remote(META, OLD, NOW - 1000);
+                if (reconciled) { put(f.local(META), OLD, NOW - 1000); f.sync("before-start"); }
+                Files.delete(f.cloud(META).toPath()); f.marker();
+                JSONObject startup = f.sync("before-start");
+                check(!startup.getBoolean("start_allowed"), "launcher not warned");
+                put(f.local(META), "{}", NOW - 10);
+                check(f.action(f.sync("after-exit"), META).equals("blocked; cloud not materialized"), "fresh save upload allowed");
+                check(!f.cloud(META).exists() && get(f.local(META)).equals("{}"), "missing cloud was overwritten");
+            });
+            test("tombstone mirror never downloads over local " + reconciled, () -> {
+                Fixture f = new Fixture(); f.remote(META, OLD, NOW - 1000); put(f.local(META), OLD, NOW - 1000);
+                if (reconciled) f.sync("before-start");
+                f.remote(META, NEW, NOW - 100); f.entry(META, sha(NEW), NOW - 100, "2");
+                String action = f.action(f.sync("before-start"), META);
+                check(!action.equals("download") && get(f.local(META)).equals(OLD), "deleted mirror was treated as live");
+            });
+        }
+        test("unchanged local and unexplained remote deletion conflict", () -> {
+            Fixture f = new Fixture(); f.baseline(); f.remote(META, OLD, NOW - 1000);
+            Files.delete(f.cloud(RUN).toPath()); f.entries.remove(RUN); f.inventory();
+            check(f.action(f.sync("before-start"), RUN).equals("content conflict"), "null download silently ignored");
+            check(get(f.local(RUN)).equals(OLD), "local lost on deletion conflict");
+        });
+        for (boolean newerQuest : new boolean[] {true, false}) {
+            test("unreconciled three day gap " + newerQuest, () -> {
+                Fixture f = new Fixture(); f.marker();
+                f.remote(META, OLD, NOW - (newerQuest ? 3 * 86400 + 10 : 10));
+                put(f.local(META), NEW, NOW - (newerQuest ? 10 : 3 * 86400 + 10));
+                check(f.action(f.sync("after-exit"), META).equals(newerQuest ? "upload" : "download"), "session gap treated as skew");
+            });
+        }
+        test("after-exit transient failure retains registration until successful retry", () -> {
+            Fixture f = new Fixture(); f.baseline(); f.marker(); put(f.local(RUN), NEW, NOW - 10);
+            File registration = new File(f.host, "port-processes/123"); put(registration, "2742830 456", NOW);
+            AtomicInteger releases = new AtomicInteger();
+            PortAutoCloud.LockedTask<Object> release = () -> { releases.incrementAndGet(); Files.delete(registration.toPath()); return null; };
+            put(new File(f.host, "status.json"), "{", NOW);
+            PortAutoCloud.afterExit(f.host, 2742830, () -> false, () -> PortAutoCloud.syncLocked(f.host, 2742830, f.local, "after-exit"), release);
+            check(registration.exists() && releases.get() == 0, "failed sync released registration");
+            PortAutoCloud.writeStatusSnapshot(new File(f.host, "status.json"), "{\"logged_on\":true,\"steam_login_state\":\"Logged On\"}");
+            PortAutoCloud.afterExit(f.host, 2742830, () -> false, () -> PortAutoCloud.syncLocked(f.host, 2742830, f.local, "after-exit"), release);
+            check(!registration.exists() && releases.get() == 1 && get(f.cloud(RUN)).equals(NEW), "successful retry did not upload and release");
+        });
+        test("blocked file retries are bounded", () -> {
+            File host = Files.createTempDirectory("mt2-exit-retry-").toFile(); AtomicInteger releases = new AtomicInteger();
+            JSONObject blocked = new JSONObject().put("ok", true).put("files", new JSONArray()
+                .put(new JSONObject().put("action", "blocked; Save is being written; retry on next pass")));
+            for (int i = 1; i <= PortAutoCloud.MAX_EXIT_ATTEMPTS; i++) {
+                PortAutoCloud.afterExit(host, 2742830, () -> false, () -> blocked, releases::incrementAndGet);
+                check(releases.get() == (i == PortAutoCloud.MAX_EXIT_ATTEMPTS ? 1 : 0), "wrong retry bound");
+            }
+            check(!new File(host, "autocloud/2742830-exit-retries").exists(), "retry counter not cleared");
+        });
+        test("atomic status readers always see complete JSON", () -> {
+            File target = new File(Files.createTempDirectory("mt2-status-").toFile(), "status.json");
+            PortAutoCloud.writeStatusSnapshot(target, "{\"generation\":0}");
+            AtomicBoolean done = new AtomicBoolean(); AtomicReference<Throwable> error = new AtomicReference<>();
+            Thread reader = new Thread(() -> {
+                try { while (!done.get()) new JSONObject(get(target)).getInt("generation"); }
+                catch (Throwable e) { error.set(e); }
+            });
+            reader.start();
+            try { for (int i = 1; i <= 50; i++) PortAutoCloud.writeStatusSnapshot(target, "{\"generation\":" + i + "}"); }
+            finally { done.set(true); reader.join(); }
+            check(error.get() == null, "reader observed partial status: " + error.get());
+            check(new JSONObject(get(target)).getInt("generation") == 50, "last status missing");
         });
         System.out.println("AutoCloud tests passed=" + passed + " failed=" + failed);
         if (failed > 0) System.exit(1);
