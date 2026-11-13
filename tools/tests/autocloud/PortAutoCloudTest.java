@@ -173,6 +173,46 @@ public class PortAutoCloudTest {
         String completedHistory = new JSONObject().put("_runEntries", new JSONArray().put(new JSONObject()
             .put("runId", "completed-run").put("isFull", true).put("runDataJson", new JSONObject()
                 .put("id", "completed-run").put("isFull", true).put("endless", false).toString()))).toString();
+        for (String inventory : new String[] {"old", "dropped", "deleted", "deleted bytes"}) {
+            for (String mode : new String[] {"upload", "disabled", "startup", "PC changed", "corrupt"}) {
+                test("new Quest run after completed deletion " + inventory + " " + mode, () -> {
+                    Fixture f = new Fixture();
+                    f.remote(META, OLD, NOW - 1000);
+                    f.remote(RUN, finished, NOW - 1000); put(f.local(RUN), finished, NOW - 1000);
+                    f.sync("before-start"); f.marker(); Files.delete(f.local(RUN).toPath());
+                    put(f.local("run-history/RunHistory.json"), completedHistory, NOW - 100);
+                    check(f.action(f.sync("after-exit"), RUN).equals("completed run cloud deletion staged"), "deletion setup");
+                    if (inventory.equals("dropped")) { f.entries.remove(RUN); f.inventory(); }
+                    if (inventory.startsWith("deleted")) f.entry(RUN, sha(finished), NOW - 1000, "2");
+                    if (inventory.equals("deleted bytes")) put(f.cloud(RUN), finished, NOW - 1000);
+                    String next = "{\"id\":\"quest-C\"}";
+                    put(f.local(RUN), mode.equals("corrupt") ? "{" : next, NOW - 10);
+                    if (mode.equals("disabled")) Files.delete(new File(f.host, "autocloud/2742830.allow-uploads").toPath());
+                    String pc = "{\"id\":\"pc-B\"}";
+                    if (mode.equals("PC changed")) f.remote(RUN, pc, NOW - 20);
+                    String action = f.action(f.sync(mode.equals("startup") ? "before-start" : "after-exit"), RUN);
+                    String expected = mode.equals("PC changed") ? "content conflict" :
+                        mode.equals("disabled") || mode.equals("startup") ? "upload disabled" : "upload";
+                    check(mode.equals("corrupt") ? action.startsWith("blocked;") : action.equals(expected), "unexpected action " + action);
+                    check(get(f.local(RUN)).equals(mode.equals("corrupt") ? "{" : next), "Quest save changed");
+                    if (mode.equals("upload")) check(get(f.cloud(RUN)).equals(next), "new Quest run missing");
+                    else if (mode.equals("PC changed")) {
+                        check(get(f.cloud(RUN)).equals(pc), "PC run overwritten");
+                        check(new File(f.local(RUN).getPath() + ".conflict-" + (NOW - 20) + "-" + sha(pc).substring(0, 12)).isFile(), "PC conflict missing");
+                    } else check(inventory.equals("deleted bytes") ? get(f.cloud(RUN)).equals(finished) : !f.cloud(RUN).exists(), "unexpected upload");
+                });
+            }
+        }
+        for (boolean dropped : new boolean[] {false, true}) {
+            test("unexplained cloud deletion still conflicts " + dropped, () -> {
+                Fixture f = new Fixture(); f.baseline(); f.remote(META, OLD, NOW - 1000); f.marker();
+                Files.delete(f.cloud(RUN).toPath());
+                if (dropped) { f.entries.remove(RUN); f.inventory(); }
+                put(f.local(RUN), NEW, NOW - 10);
+                check(f.action(f.sync("after-exit"), RUN).equals("content conflict"), "unexplained cloud deletion ignored");
+                check(!f.cloud(RUN).exists() && get(f.local(RUN)).equals(NEW), "conflicting deletion overwritten");
+            });
+        }
         test("completed run deletion stages only acknowledged single-player save", () -> {
             Fixture f = new Fixture(); f.remote(RUN, finished, NOW - 1000); put(f.local(RUN), finished, NOW - 1000);
             f.sync("before-start"); f.marker(); Files.delete(f.local(RUN).toPath());
@@ -180,7 +220,15 @@ public class PortAutoCloudTest {
             JSONObject report = f.sync("after-exit");
             check(f.action(report, RUN).equals("completed run cloud deletion staged"), "completion not deleted");
             check(!f.cloud(RUN).exists() && !f.local(RUN).exists(), "completed run survived");
+            JSONObject tombstone = new JSONObject(get(new File(f.host, "autocloud/2742830-state.json")))
+                .getJSONObject("files").getJSONObject(RUN);
+            check(tombstone.has("local_sha") && tombstone.isNull("local_sha") && tombstone.has("cloud_sha") &&
+                tombstone.isNull("cloud_sha") && tombstone.getString("deleted_cloud_sha").equals(sha(finished)), "deletion tombstone missing");
             check(f.action(f.sync("after-exit"), RUN).startsWith("skipped deleted/absent"), "deletion retry failed");
+            // Simulate interruption between durable intent and mirror removal.
+            put(f.cloud(RUN), finished, NOW - 1000);
+            check(f.action(f.sync("after-exit"), RUN).equals("completed run cloud deletion staged"), "deletion intent retry failed");
+            check(!f.cloud(RUN).exists() && !f.local(RUN).exists(), "intent retry resurrected run");
             f.remote(RUN, NEW, NOW - 10);
             check(f.action(f.sync("before-start"), RUN).equals("download"), "new PC run blocked after deletion");
         });

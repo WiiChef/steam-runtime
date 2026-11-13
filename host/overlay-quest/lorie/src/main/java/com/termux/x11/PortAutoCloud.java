@@ -201,13 +201,18 @@ public final class PortAutoCloud {
 
     static String decide(String local, String cloud, JSONObject previous, String change,
                          long qt, long ct, long now, boolean upload) {
+        // A durable deletion intent may precede removal of the old mirror bytes.
+        // Only those exact bytes belong to the deletion we staged.
+        if (previous != null && previous.has("deleted_cloud_sha") && previous.isNull("cloud_sha") &&
+            Objects.equals(cloud, previous.optString("deleted_cloud_sha"))) cloud = null;
         if (local == null) {
             if (previous != null) {
                 // App-wide ChangeNumber cannot identify a change to this file.
                 // Unreconciled history compares against the last validated local bytes.
-                String baseline = previous.has("cloud_sha") ? previous.optString("cloud_sha") :
+                String baseline = previous.has("cloud_sha") ? previous.optString("cloud_sha", null) :
                     previous.optString("seen_local_sha", previous.optString("local_sha", null));
-                boolean cloudChanged = cloud != null && baseline != null && !cloud.equals(baseline);
+                boolean cloudChanged = cloud != null && (previous.has("cloud_sha") || baseline != null) &&
+                    !cloud.equals(baseline);
                 if (!cloudChanged) return "local deletion";
             }
             return ct > now || ct < 0 ? "clock conflict" : "download";
@@ -324,7 +329,7 @@ public final class PortAutoCloud {
                     }
                     // Missing mirror entries (including Steam tombstones) are isolated per file.
                     // syncstate values are undocumented, so never infer deletion from a numeric value alone.
-                    if (meta != null && (!cloud.isFile() || "2".equals(meta.get("persiststate")))) {
+                    if (meta != null && (!cloud.isFile() || "2".equals(meta.get("persiststate"))) && !local.isFile()) {
                         row.put("action", "skipped deleted/absent cloud entry"); continue;
                     }
                     // Record existence before validating or changing bytes. An invalid save must
@@ -339,11 +344,11 @@ public final class PortAutoCloud {
                         previous.put("seen_local_sha", localSave.sha);
                         write(stateFile, state.toString(2).getBytes(StandardCharsets.UTF_8), now);
                     }
-                    Save remoteSave = meta == null ? null : new Save(cloud);
+                    Save remoteSave = meta == null || !cloud.isFile() ? null : new Save(cloud);
                     if (remoteSave != null && !remoteSave.sha.equalsIgnoreCase(meta.get("sha")))
                         throw new IOException("Cloud cache hash mismatch");
                     long qt = localSave == null ? 0 : localSave.modified / 1000L;
-                    long ct = meta == null ? 0 : Long.parseLong(meta.get("remotetime"));
+                    long ct = remoteSave == null ? 0 : Long.parseLong(meta.get("remotetime"));
                     String action = decide(localSave == null ? null : localSave.sha,
                         remoteSave == null ? null : remoteSave.sha, previous, change, qt, ct, now, upload);
                     row.put("action", action).put("quest_time", qt).put("cloud_time", ct);
@@ -354,11 +359,15 @@ public final class PortAutoCloud {
                         row.put("action", "local deletion retained; cloud deletion not staged");
                         // All other missing files retain delete-and-rename crash protection.
                         if (upload && name.equals("saves/save-singlePlayer.json") && remoteSave != null &&
-                            previous != null && remoteSave.sha.equals(previous.optString("cloud_sha")) &&
+                            previous != null && remoteSave.sha.equals(previous.optString("cloud_sha",
+                                previous.optString("deleted_cloud_sha"))) &&
                             ct >= 0 && ct <= now) {
                             Save completion = completedRunHistory(quest, remoteSave);
                             if (completion != null) {
                                 row.put("conflict", conflict(quest, name, remoteSave.bytes, ct));
+                                // Persist intent before removing bytes so a crash can safely retry.
+                                history.put(name, record(null, null, change, ct).put("deleted_cloud_sha", remoteSave.sha));
+                                write(stateFile, state.toString(2).getBytes(StandardCharsets.UTF_8), now);
                                 if (!new File(dir, appid + ".allow-uploads").isFile()) throw new IOException("Upload marker removed");
                                 completion.unchanged(safe(quest, "run-history/RunHistory.json"));
                                 if (local.exists()) throw new IOException("Local save appeared before deletion");
@@ -389,6 +398,7 @@ public final class PortAutoCloud {
                         if (!new File(dir, appid + ".allow-uploads").isFile()) throw new IOException("Upload marker removed");
                         localSave.unchanged(local);
                         if (remoteSave != null) remoteSave.unchanged(cloud);
+                        if (remoteSave == null && cloud.exists()) throw new IOException("Cloud save appeared before upload");
                         if (!read(cache).equals(snapshot)) throw new IOException("Cloud inventory changed");
                         write(cloud, localSave.bytes, qt);
                         // Steam must acknowledge these staged bytes in its next inventory.
@@ -417,7 +427,8 @@ public final class PortAutoCloud {
     }
 
     private static JSONObject record(String local, String cloud, String change, long ct) throws JSONException {
-        return new JSONObject().put("local_sha", local).put("cloud_sha", cloud == null ? JSONObject.NULL : cloud)
+        return new JSONObject().put("local_sha", local == null ? JSONObject.NULL : local)
+            .put("cloud_sha", cloud == null ? JSONObject.NULL : cloud)
             .put("cloud_change_number", change).put("cloud_time", ct);
     }
 }
