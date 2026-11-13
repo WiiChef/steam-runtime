@@ -118,6 +118,8 @@ public class SteamRuntimeService extends Service {
                             Log.i(TAG, "Reaping exited port process pid=" + pid + " appid=" + data[0]);
                             entry.setLastModified(now);
                             String appid = data[0];
+                            if ("2742830".equals(appid)) PortAutoCloud.sync(this, 2742830,
+                                new File("/sdcard/Android/data/com.game.monstertrain2/files"), "after-exit");
                             String result = runInProot("SteamAppId=" + appid + " SteamGameId=" + appid
                                     + " timeout 5 /usr/local/bin/steamstate /root/steamrtarm64 " + appid, 7);
                             if (result != null && result.contains("\"ok\":true")) {
@@ -520,7 +522,20 @@ public class SteamRuntimeService extends Service {
 
         String extras = SteamStatusExtras.fragment(context, serviceInstance, rootfsTarget, steamAlive && ipcObjectReady);
 
+        org.json.JSONArray activePorts = new org.json.JSONArray();
+        File[] registrations = new File(filesDir, "port-processes").listFiles();
+        if (registrations != null) for (File entry : registrations) {
+            try {
+                String[] registration = new String(java.nio.file.Files.readAllBytes(entry.toPath()), java.nio.charset.StandardCharsets.UTF_8).trim().split("\\s+");
+                int pid = Integer.parseInt(entry.getName());
+                String stat = new String(java.nio.file.Files.readAllBytes(new File("/proc/"+pid+"/stat").toPath()), java.nio.charset.StandardCharsets.UTF_8);
+                String[] fields = stat.substring(stat.lastIndexOf(')')+2).split("\\s+");
+                if (registration.length == 2 && fields[19].equals(registration[1]))
+                    activePorts.put(new org.json.JSONObject().put("appid",Integer.parseInt(registration[0])).put("pid",pid));
+            } catch (Exception ignored) { }
+        }
         String json = "{\n"
+                + "  \"port_games\": " + activePorts.toString() + ",\n"
                 + "  \"service_running\": " + running + ",\n"
                 + "  \"rootfs_ready\": " + rootfsReady + ",\n"
                 + "  \"x_server_alive\": " + xAlive + ",\n"
@@ -940,7 +955,8 @@ public class SteamRuntimeService extends Service {
     }
 
     public static final List<KnownPort> KNOWN_PORTS = Arrays.asList(
-            new KnownPort("Slay the Spire 2", "com.game.sts2launcher.modmanager", 2868840)
+            new KnownPort("Slay the Spire 2", "com.game.sts2launcher.modmanager", 2868840),
+            new KnownPort("Monster Train 2", "com.game.monstertrain2", 2742830)
     );
 
     public static boolean isPackageInstalled(Context context, String pkg) {
