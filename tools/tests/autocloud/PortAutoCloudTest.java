@@ -49,6 +49,7 @@ public class PortAutoCloudTest {
         final File mirror = new File(steam, "steamapps/compatdata/2742830/pfx/drive_c/users/steamuser/AppData/LocalLow/Shiny Shoe/MonsterTrain2");
         final File cache = new File(steam, "userdata/123/2742830/remotecache.vdf");
         final Map<String, String> entries = new TreeMap<>();
+        String change = "12";
         Fixture() throws Exception {
             put(new File(host, "status.json"), "{\"logged_on\":true,\"steam_login_state\":\"Logged On\"}", NOW);
         }
@@ -64,7 +65,7 @@ public class PortAutoCloudTest {
             inventory();
         }
         void inventory() throws Exception {
-            put(cache, "\"2742830\" {\n\"ChangeNumber\" \"12\"\n" + String.join("", entries.values()) + "}\n", NOW);
+            put(cache, "\"2742830\" {\n\"ChangeNumber\" \"" + change + "\"\n" + String.join("", entries.values()) + "}\n", NOW);
         }
         void marker() throws Exception { put(new File(host, "autocloud/2742830.allow-uploads"), "", NOW); }
         JSONObject sync(String phase) throws Exception {
@@ -84,6 +85,32 @@ public class PortAutoCloudTest {
             put(local(RUN), OLD, NOW - 1000);
             check(action(sync("before-start"), RUN).equals("identical"), "baseline");
         }
+    }
+
+    private static class LivenessFixture {
+        final File host = Files.createTempDirectory("mt2-liveness-").toFile();
+        final File registrations = new File(host, "port-processes");
+        final AtomicInteger procListings = new AtomicInteger();
+        final File proc = new File(host, "proc") {
+            @Override public File[] listFiles() { procListings.incrementAndGet(); return null; }
+        };
+        final AtomicLong elapsed = new AtomicLong(1000L);
+        final AtomicReference<List<android.app.ActivityManager.RunningAppProcessInfo>> processes = new AtomicReference<>();
+        final PortProcessLiveness liveness = new PortProcessLiveness(registrations, proc, processes::get, elapsed::get);
+        LivenessFixture() throws Exception { registrations.mkdirs(); register(123, 456); }
+        void register(int pid, long start) throws Exception {
+            put(new File(registrations, Integer.toString(pid)), "2742830 " + start, NOW);
+        }
+        void stat(long start) throws Exception {
+            put(new File(proc, "123/stat"), "123 (game process) S " + "0 ".repeat(18) + start, NOW);
+        }
+        void visible(int pid, String name, int uid) {
+            android.app.ActivityManager.RunningAppProcessInfo info = new android.app.ActivityManager.RunningAppProcessInfo();
+            info.pid = pid; info.processName = name; info.uid = uid;
+            processes.set(Collections.singletonList(info));
+        }
+        boolean live() { return liveness.hasLiveProcess("2742830", "com.game.monstertrain2"); }
+        void timeout() { elapsed.addAndGet(PortProcessLiveness.UNKNOWN_TIMEOUT_MS); }
     }
 
     public static void main(String[] args) throws Exception {
@@ -135,18 +162,66 @@ public class PortAutoCloudTest {
             JSONObject state = new JSONObject(get(new File(f.host, "autocloud/2742830-state.json")));
             check(state.getJSONObject("files").getJSONObject(RUN).getString("cloud_change_number").equals("12"), "cloud revision missing");
         });
-        test("marker permits revision-checked deletion", () -> {
+        test("marker never propagates run deletion", () -> {
             Fixture f = new Fixture(); f.baseline(); f.marker(); Files.delete(f.local(RUN).toPath());
-            check(f.action(f.sync("after-exit"), RUN).equals("staged local deletion"), "deletion not staged");
-            check(!f.cloud(RUN).exists() && !f.local(RUN).exists(), "deletion");
-            check(new File(f.local, "saves").listFiles((dir, name) -> name.contains(".conflict-")).length == 1, "deleted cloud loser missing");
+            for (int i = 0; i < 2; i++) {
+                check(f.action(f.sync("after-exit"), RUN).startsWith("local deletion"), "deletion action");
+                check(get(f.cloud(RUN)).equals(OLD) && !f.local(RUN).exists(), "cloud deletion or resurrection");
+            }
         });
-        test("changed cloud revision blocks deletion", () -> {
+        test("deleted run then new PC run downloads", () -> {
             Fixture f = new Fixture(); f.baseline(); f.marker(); Files.delete(f.local(RUN).toPath());
+            f.sync("after-exit"); f.remote(RUN, NEW, NOW - 500);
+            check(f.action(f.sync("before-start"), RUN).equals("download"), "new PC run suppressed");
+            check(get(f.cloud(RUN)).equals(NEW) && get(f.local(RUN)).equals(NEW), "new PC run lost");
+            check(f.action(f.sync("before-start"), RUN).equals("identical"), "revision not reconciled");
+        });
+        test("deleted run with changed hash and older mtime downloads", () -> {
+            Fixture f = new Fixture(); f.baseline(); Files.delete(f.local(RUN).toPath());
+            f.remote(RUN, NEW, NOW - 2000);
+            check(f.action(f.sync("before-start"), RUN).equals("download"), "mtime overrode changed revision");
+            check(get(f.local(RUN)).equals(NEW), "new content missing");
+        });
+        test("deleted run with changed ChangeNumber downloads", () -> {
+            Fixture f = new Fixture(); f.baseline(); Files.delete(f.local(RUN).toPath());
+            f.change = "13"; f.inventory();
+            check(f.action(f.sync("before-start"), RUN).equals("download"), "ChangeNumber ignored");
+            check(get(f.local(RUN)).equals(OLD), "revision download missing");
+        });
+        test("failed changed-revision download retains baseline for retry", () -> {
+            Fixture f = new Fixture(); f.baseline(); Files.delete(f.local(RUN).toPath());
             f.remote(RUN, NEW, NOW - 500);
-            check(f.action(f.sync("after-exit"), RUN).startsWith("local deletion"), "unsafe deletion staged");
-            check(get(f.cloud(RUN)).equals(NEW) && !f.local(RUN).exists(), "changed cloud lost or resurrected");
+            File parent = f.local(RUN).getParentFile(); Files.delete(parent.toPath());
+            put(parent, "parent temporarily unavailable", NOW);
+            check(f.action(f.sync("before-start"), RUN).startsWith("blocked;"), "write failure ignored");
+            Files.delete(parent.toPath()); parent.mkdirs();
+            check(f.action(f.sync("before-start"), RUN).equals("download"), "failed download lost previous revision");
+            check(get(f.local(RUN)).equals(NEW), "retry lost PC save");
         });
+        test("deleted run with future PC revision stays blocked", () -> {
+            Fixture f = new Fixture(); f.baseline(); Files.delete(f.local(RUN).toPath());
+            f.remote(RUN, NEW, NOW + 3600);
+            check(f.action(f.sync("before-start"), RUN).equals("clock conflict"), "future revision accepted");
+            check(!f.local(RUN).exists() && get(f.cloud(RUN)).equals(NEW), "future revision changed");
+        });
+        for (String name : new String[] {META, "metagameSave.json.backup", "preferences.json",
+                RUN, "run-history/RunHistory.json", "development-save/metagameSave.json", "staging-save/" + RUN}) {
+            test("crash mid delete-rename never changes cloud " + name, () -> {
+                Fixture f = new Fixture(); f.remote(name, OLD, NOW - 1000);
+                put(f.local(name), OLD, NOW - 1000); f.sync("before-start"); f.marker();
+                File temporary = new File(f.local(name).getPath() + ".tmp"); put(temporary, NEW, NOW - 100);
+                Files.delete(f.local(name).toPath());
+                String inventory = get(f.cache); long modified = f.cloud(name).lastModified();
+                // Simulate a crash before rename, then repeated exit/startup passes after restart.
+                for (String phase : new String[] {"after-exit", "before-start", "after-exit"}) {
+                    check(f.action(f.sync(phase), name).startsWith("local deletion"), "missing local file downloaded");
+                    check(get(f.cloud(name)).equals(OLD) && f.cloud(name).lastModified() == modified,
+                        "cloud bytes or timestamp changed");
+                    check(get(f.cache).equals(inventory), "cloud inventory changed");
+                }
+                check(!f.local(name).exists() && get(temporary).equals(NEW), "crash snapshot changed");
+            });
+        }
         test("observed unsynced file deletion", () -> {
             Fixture f = new Fixture(); f.remote(RUN, OLD, NOW - 1000); put(f.local(RUN), NEW, NOW - 100);
             f.sync("before-start"); Files.delete(f.local(RUN).toPath()); f.marker(); f.sync("after-exit");
@@ -308,6 +383,75 @@ public class PortAutoCloudTest {
             check(new File(f.host, "autocloud/2742830-state.json").mkdirs(), "create history failure");
             check(f.action(f.sync("before-start"), RUN).startsWith("blocked;"), "history failure allowed mutation");
             check(!f.local(RUN).exists(), "downloaded without durable history");
+        });
+        test("proc listing null still syncs and releases after bounded uncertainty", () -> {
+            LivenessFixture f = new LivenessFixture(); AtomicInteger calls = new AtomicInteger();
+            android.util.Log.warnings.clear();
+            check(f.proc.listFiles() == null, "proc null fixture");
+            f.procListings.set(0);
+            PortAutoCloud.afterExit(f.host, 2742830, f::live, calls::incrementAndGet, calls::incrementAndGet);
+            check(calls.get() == 0, "uncertain process skipped grace");
+            f.elapsed.addAndGet(PortProcessLiveness.UNKNOWN_TIMEOUT_MS - 1);
+            check(f.live(), "uncertainty expired early");
+            f.elapsed.incrementAndGet();
+            PortAutoCloud.afterExit(f.host, 2742830, f::live, calls::incrementAndGet, calls::incrementAndGet);
+            check(calls.get() == 2 && !f.live(), "unknown PID blocked exit forever");
+            check(f.procListings.get() == 0, "production enumerated procfs");
+            check(android.util.Log.warnings.stream().filter(message -> message.contains("liveness timeout")).count() == 1,
+                "timeout not logged exactly once");
+        });
+        test("registered start time keeps live port protected", () -> {
+            LivenessFixture f = new LivenessFixture(); f.stat(456); f.timeout();
+            check(f.live(), "live registered process missed");
+        });
+        test("PID reuse does not protect exited registration", () -> {
+            LivenessFixture f = new LivenessFixture(); f.stat(789);
+            check(!f.live(), "reused PID treated as original port");
+        });
+        test("registered PID exists with unreadable stat", () -> {
+            LivenessFixture f = new LivenessFixture(); new File(f.proc, "123").mkdirs();
+            check(f.live(), "visible registered PID missed"); f.timeout();
+            check(f.live(), "positive PID evidence timed out");
+        });
+        test("ActivityManager sees registered PID without proc visibility", () -> {
+            LivenessFixture f = new LivenessFixture(); f.visible(123, "native-port", android.os.Process.myUid());
+            check(f.live(), "ActivityManager registered PID missed"); f.timeout();
+            check(f.live(), "ActivityManager evidence timed out");
+        });
+        test("ActivityManager sees pre-registration relaunch", () -> {
+            LivenessFixture f = new LivenessFixture(); f.timeout();
+            f.visible(999, "com.game.monstertrain2:unity", android.os.Process.myUid());
+            AtomicInteger calls = new AtomicInteger();
+            PortAutoCloud.afterExit(f.host, 2742830, f::live, calls::incrementAndGet, calls::incrementAndGet);
+            check(calls.get() == 0, "pre-registration relaunch synced/released");
+        });
+        test("ActivityManager evidence resets uncertainty grace", () -> {
+            LivenessFixture f = new LivenessFixture(); check(f.live(), "initial grace"); f.timeout();
+            check(!f.live(), "initial timeout");
+            f.visible(123, "com.game.monstertrain2", android.os.Process.myUid()); check(f.live(), "relaunch");
+            f.processes.set(null); check(f.live(), "relaunch did not reset grace");
+            f.timeout(); check(!f.live(), "second timeout");
+        });
+        test("other UID ActivityManager entry cannot block reaping", () -> {
+            LivenessFixture f = new LivenessFixture(); f.visible(123, "com.game.monstertrain2", 99999);
+            check(f.live(), "initial unknown grace"); f.timeout();
+            check(!f.live(), "unrelated UID blocked reaping");
+        });
+        test("ActivityManager failure has bounded fallback", () -> {
+            LivenessFixture f = new LivenessFixture();
+            PortProcessLiveness liveness = new PortProcessLiveness(f.registrations, f.proc,
+                () -> { throw new SecurityException("denied"); }, f.elapsed::get);
+            check(liveness.hasLiveProcess("2742830", "com.game.monstertrain2"), "initial failure grace");
+            f.timeout();
+            check(!liveness.hasLiveProcess("2742830", "com.game.monstertrain2"), "failure blocked forever");
+        });
+        test("registration listing failure has bounded fallback", () -> {
+            LivenessFixture f = new LivenessFixture();
+            File denied = new File(f.host, "denied") { @Override public File[] listFiles() { return null; } };
+            PortProcessLiveness liveness = new PortProcessLiveness(denied, f.proc, () -> null, f.elapsed::get);
+            check(liveness.hasLiveProcess("2742830", "com.game.monstertrain2"), "initial directory grace");
+            f.timeout();
+            check(!liveness.hasLiveProcess("2742830", "com.game.monstertrain2"), "directory failure blocked forever");
         });
         System.out.println("AutoCloud tests passed=" + passed + " failed=" + failed);
         if (failed > 0) System.exit(1);

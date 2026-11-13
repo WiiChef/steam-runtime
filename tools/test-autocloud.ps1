@@ -15,6 +15,7 @@ New-Item -ItemType Directory -Path $classes | Out-Null
 $sources = @(Get-ChildItem (Join-Path $PSScriptRoot 'tests\autocloud') -Recurse -Filter '*.java' |
     Select-Object -ExpandProperty FullName)
 $sources += Join-Path $repo 'host\overlay-quest\lorie\src\main\java\com\termux\x11\PortAutoCloud.java'
+$sources += Join-Path $repo 'host\overlay-quest\lorie\src\main\java\com\termux\x11\PortProcessLiveness.java'
 & (Join-Path $JavaHome 'bin\javac.exe') -encoding UTF-8 -cp $JsonJar -d $classes @sources
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & (Join-Path $JavaHome 'bin\java.exe') -cp "$classes;$JsonJar" com.termux.x11.PortAutoCloudTest

@@ -98,6 +98,7 @@ public class SteamRuntimeService extends Service {
         if (portWatcherThread != null && portWatcherThread.isAlive()) return;
         portWatcherRunning = true;
         portWatcherThread = new Thread(() -> {
+            portProcessLiveness = new PortProcessLiveness(this);
             File registrations = new File(getFilesDir(), "port-processes");
             while (portWatcherRunning && !isShuttingDown) {
                 File[] entries = registrations.listFiles();
@@ -107,15 +108,12 @@ public class SteamRuntimeService extends Service {
                         try {
                             long now = System.currentTimeMillis();
                             if (now - entry.lastModified() < 2500L) continue;
-                            String[] data = readPortRegistration(entry);
+                            String[] data = PortProcessLiveness.readRegistration(entry);
                             if (data == null) { entry.delete(); continue; }
                             int pid = Integer.parseInt(entry.getName());
-                            long liveStart = processStartTime(pid);
-                            long registeredStart = Long.parseLong(data[1]);
-                            if (liveStart < 0 && new File("/proc/" + pid).exists()) continue;
-                            if (liveStart == registeredStart) continue;
-                            if (findSteamPid() <= 0) continue;
                             String appid = data[0];
+                            if (hasLivePortProcess(appid)) continue;
+                            if (findSteamPid() <= 0) continue;
                             PortAutoCloud.afterExit(getFilesDir(), Integer.parseInt(appid),
                                 () -> hasLivePortProcess(appid), () -> {
                                 Log.i(TAG, "Reaping exited port process pid=" + pid + " appid=" + appid);
@@ -146,54 +144,15 @@ public class SteamRuntimeService extends Service {
         portWatcherThread.start();
     }
 
-    /** Include pre-SteamAPI processes, which have not written a registration yet. */
+    private PortProcessLiveness portProcessLiveness;
+
+    /** ActivityManager also covers package startup before SteamAPI writes a registration. */
     private boolean hasLivePortProcess(String appid) {
-        File[] registrations = new File(getFilesDir(), "port-processes").listFiles();
-        if (registrations != null) for (File file : registrations) {
-            if (!file.getName().matches("[0-9]+")) continue;
-            String[] data = readPortRegistration(file);
-            if (data == null || !appid.equals(data[0])) continue;
-            int pid = Integer.parseInt(file.getName());
-            long start = processStartTime(pid);
-            if (start == Long.parseLong(data[1]) || (start < 0 && new File("/proc/" + pid).exists())) return true;
-        }
         String packageName = null;
         for (KnownPort port : KNOWN_PORTS) {
             if (Integer.toString(port.steamAppId).equals(appid)) packageName = port.packageName;
         }
-        if (packageName == null) return false;
-        File[] processes = new File("/proc").listFiles();
-        if (processes == null) return true;
-        for (File process : processes) {
-            if (!process.getName().matches("[0-9]+")) continue;
-            try {
-                byte[] bytes = Files.readAllBytes(new File(process, "cmdline").toPath());
-                int end = 0;
-                while (end < bytes.length && bytes[end] != 0) end++;
-                String name = new String(bytes, 0, end, StandardCharsets.UTF_8);
-                if (name.equals(packageName) || name.startsWith(packageName + ":")) return true;
-            } catch (IOException ignored) { }
-        }
-        return false;
-    }
-
-    private String[] readPortRegistration(File file) {
-        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
-            String[] fields = reader.readLine().trim().split("\\s+");
-            if (fields.length != 2 || !fields[0].matches("[0-9]{1,10}") || !fields[1].matches("[0-9]+")) return null;
-            return fields;
-        } catch (Exception ignored) { return null; }
-    }
-
-    /** Linux /proc stat field 22 is process start time; parsing after the final ')' handles spaces in comm. */
-    private long processStartTime(int pid) {
-        try (BufferedReader reader = new BufferedReader(new FileReader("/proc/" + pid + "/stat"))) {
-            String line = reader.readLine();
-            int end = line == null ? -1 : line.lastIndexOf(')');
-            if (end < 0) return -1L;
-            String[] fields = line.substring(end + 2).trim().split("\\s+");
-            return fields.length > 19 ? Long.parseLong(fields[19]) : -1L;
-        } catch (Exception ignored) { return -1L; }
+        return portProcessLiveness.hasLiveProcess(appid, packageName);
     }
 
     private void startForegroundInternal(String text) {

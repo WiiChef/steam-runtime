@@ -199,9 +199,17 @@ public final class PortAutoCloud {
         }
     }
 
-    static String decide(String local, String cloud, JSONObject previous, long qt, long ct, long now, boolean upload) {
+    static String decide(String local, String cloud, JSONObject previous, String change,
+                         long qt, long ct, long now, boolean upload) {
         if (local == null) {
-            if (previous != null) return "local deletion";
+            if (previous != null) {
+                // Only a reconciled cloud revision can prove that a PC changed this file.
+                // Legacy seen_local-only records retain their local deletion protection.
+                boolean cloudChanged = previous.has("cloud_sha") && cloud != null &&
+                    (!cloud.equals(previous.optString("cloud_sha")) ||
+                     !change.equals(previous.optString("cloud_change_number")));
+                if (!cloudChanged) return "local deletion";
+            }
             return ct > now || ct < 0 ? "clock conflict" : "download";
         }
         if (local.equals(cloud)) return "identical";
@@ -314,28 +322,15 @@ public final class PortAutoCloud {
                     long qt = localSave == null ? 0 : localSave.modified / 1000L;
                     long ct = meta == null ? 0 : Long.parseLong(meta.get("remotetime"));
                     String action = decide(localSave == null ? null : localSave.sha,
-                        remoteSave == null ? null : remoteSave.sha, previous, qt, ct, now, upload);
+                        remoteSave == null ? null : remoteSave.sha, previous, change, qt, ct, now, upload);
                     row.put("action", action).put("quest_time", qt).put("cloud_time", ct);
                     if (!read(cache).equals(snapshot)) throw new IOException("Cloud inventory changed");
                     if (localSave != null) localSave.unchanged(local);
                     if (remoteSave != null) remoteSave.unchanged(cloud);
                     if (action.equals("local deletion")) {
                         row.put("action", "local deletion retained; cloud deletion not staged");
-                        // Auto-Cloud observes on-disk deletes on session exit. Only stage a
-                        // deletion against the exact cloud revision we last reconciled.
-                        boolean sameRevision = remoteSave != null && previous != null &&
-                            remoteSave.sha.equals(previous.optString("cloud_sha")) &&
-                            ct == previous.optLong("cloud_time", -1) &&
-                            change.equals(previous.optString("cloud_change_number"));
-                        if (upload && sameRevision && ct <= now && ct >= 0) {
-                            row.put("conflict", conflict(quest, name, remoteSave.bytes, ct));
-                            if (local.exists()) throw new IOException("Local save reappeared before deletion staging");
-                            remoteSave.unchanged(cloud);
-                            if (!read(cache).equals(snapshot)) throw new IOException("Cloud inventory changed");
-                            if (!new File(dir, appid + ".allow-uploads").isFile()) throw new IOException("Upload marker removed");
-                            Files.delete(cloud.toPath());
-                            row.put("action", "staged local deletion");
-                        }
+                        // A missing local file may be a crashed delete-and-rename save.
+                        // Never remove a mirror file or propagate a cloud deletion.
                         Log.i("PortAutoCloud", row.getString("action"));
                     } else if (action.equals("download") && remoteSave != null) {
                         if (localSave != null) row.put("conflict", conflict(quest, name, localSave.bytes, qt));
@@ -343,7 +338,7 @@ public final class PortAutoCloud {
                         if (localSave != null) localSave.unchanged(local);
                         remoteSave.unchanged(cloud);
                         if (!read(cache).equals(snapshot)) throw new IOException("Cloud inventory changed");
-                        if (localSave == null) {
+                        if (localSave == null && previous == null) {
                             // Persist existence intent first. A failed history write must never
                             // leave a new local save that could later be resurrected after deletion.
                             history.put(name, new JSONObject().put("seen_local", true));
