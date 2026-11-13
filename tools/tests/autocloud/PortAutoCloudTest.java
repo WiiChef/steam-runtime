@@ -41,6 +41,12 @@ public class PortAutoCloudTest {
             result.append(String.format(Locale.ROOT, "%02x", b & 255));
         return result.toString();
     }
+    private static String sha256(String text) throws Exception {
+        StringBuilder result = new StringBuilder();
+        for (byte b : MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8)))
+            result.append(String.format(Locale.ROOT, "%02x", b & 255));
+        return result.toString();
+    }
 
     private static class Fixture {
         final File host = Files.createTempDirectory("mt2-cloud-fixture-").toFile();
@@ -68,6 +74,9 @@ public class PortAutoCloudTest {
             put(cache, "\"2742830\" {\n\"ChangeNumber\" \"" + change + "\"\n" + String.join("", entries.values()) + "}\n", NOW);
         }
         void marker() throws Exception { put(new File(host, "autocloud/2742830.allow-uploads"), "", NOW); }
+        File resolveMarker(String name) throws Exception {
+            return new File(host, "autocloud/2742830.resolve/" + PortAutoCloud.pathHash(name) + ".prefer-local");
+        }
         JSONObject sync(String phase) throws Exception {
             return PortAutoCloud.withLifecycleLock(host, 2742830,
                 () -> PortAutoCloud.syncLocked(host, 2742830, local, phase));
@@ -703,6 +712,79 @@ public class PortAutoCloudTest {
             finally { done.set(true); reader.join(); }
             check(error.get() == null, "reader observed partial status: " + error.get());
             check(new JSONObject(get(target)).getInt("generation") == 50, "last status missing");
+        });
+        test("clock conflict resolution marker honored and consumed after upload", () -> {
+            Fixture f = new Fixture();
+            f.remote(RUN, OLD, NOW - 100);
+            put(f.local(RUN), NEW, NOW - 150);
+            JSONObject beforeReport = f.sync("before-start");
+            check(f.action(beforeReport, RUN).equals("clock conflict"), "expected initial clock conflict");
+            check(beforeReport.has("dry_run") && beforeReport.getString("dry_run").contains("pending conflict"), "missing dry_run in report");
+            check(beforeReport.getString("dry_run").contains(sha256(NEW)) && beforeReport.getString("dry_run").contains(sha256(OLD)), "dry_run missing SHAs");
+            File marker = f.resolveMarker(RUN);
+            put(marker, new JSONObject().put("local_sha256", sha256(NEW)).put("cloud_sha256", sha256(OLD)).toString(), NOW);
+            check(f.action(f.sync("before-start"), RUN).equals("upload disabled"), "before-start with marker did not resolve clock conflict");
+            check(marker.exists(), "marker consumed before upload was staged");
+            f.marker();
+            JSONObject exitReport = f.sync("after-exit");
+            check(f.action(exitReport, RUN).equals("upload"), "marker did not allow upload");
+            check(get(f.cloud(RUN)).equals(NEW), "cloud mirror not updated with local save");
+            check(!marker.exists(), "marker was not consumed after upload");
+            check(get(f.local(RUN)).equals(NEW), "local save was mutated or removed");
+            File[] conflicts = new File(f.local, "saves").listFiles((dir, name) -> name.contains(".conflict-"));
+            check(conflicts != null && conflicts.length == 1 && get(conflicts[0]).equals(OLD), "cloud loser not preserved as .conflict");
+            JSONObject status = new JSONObject(get(new File(f.host, "status.json")));
+            check(status.has("autocloud_resolved"), "autocloud_resolved missing in status.json");
+            JSONObject res = status.getJSONObject("autocloud_resolved");
+            check(res.getString("file").equals(RUN) && res.getString("local_sha256").equals(sha256(NEW)) && res.getString("cloud_sha256").equals(sha256(OLD)), "status record details mismatch");
+        });
+        test("resolution marker ignored on local SHA mismatch", () -> {
+            Fixture f = new Fixture();
+            f.remote(RUN, OLD, NOW - 100);
+            put(f.local(RUN), NEW, NOW - 150);
+            f.marker();
+            File marker = f.resolveMarker(RUN);
+            put(marker, new JSONObject().put("local_sha256", sha256("{\"wrong\":1}")).put("cloud_sha256", sha256(OLD)).toString(), NOW);
+            JSONObject exitReport = f.sync("after-exit");
+            check(f.action(exitReport, RUN).equals("clock conflict"), "local SHA mismatch was not ignored");
+            check(marker.exists(), "mismatched marker was consumed");
+            check(get(f.cloud(RUN)).equals(OLD), "cloud modified despite mismatch");
+            check(get(f.local(RUN)).equals(NEW), "local modified despite mismatch");
+        });
+        test("resolution marker ignored on cloud SHA mismatch", () -> {
+            Fixture f = new Fixture();
+            f.remote(RUN, OLD, NOW - 100);
+            put(f.local(RUN), NEW, NOW - 150);
+            f.marker();
+            File marker = f.resolveMarker(RUN);
+            put(marker, new JSONObject().put("local_sha256", sha256(NEW)).put("cloud_sha256", sha256("{\"wrong\":2}")).toString(), NOW);
+            JSONObject exitReport = f.sync("after-exit");
+            check(f.action(exitReport, RUN).equals("clock conflict"), "cloud SHA mismatch was not ignored");
+            check(marker.exists(), "mismatched marker was consumed");
+            check(get(f.cloud(RUN)).equals(OLD), "cloud modified despite mismatch");
+            check(get(f.local(RUN)).equals(NEW), "local modified despite mismatch");
+        });
+        test("resolution marker supports plain text format", () -> {
+            Fixture f = new Fixture();
+            f.remote(RUN, OLD, NOW - 100);
+            put(f.local(RUN), NEW, NOW - 150);
+            f.marker();
+            File marker = f.resolveMarker(RUN);
+            put(marker, "local_sha256=" + sha256(NEW) + "\ncloud_sha256=" + sha256(OLD) + "\n", NOW);
+            check(f.action(f.sync("after-exit"), RUN).equals("upload"), "plain text marker not honored");
+            check(!marker.exists(), "plain text marker not consumed");
+            check(get(f.cloud(RUN)).equals(NEW), "cloud mirror not updated");
+        });
+        test("resolution marker never causes deletion when local save absent", () -> {
+            Fixture f = new Fixture();
+            f.remote(RUN, OLD, NOW - 100);
+            f.marker();
+            File marker = f.resolveMarker(RUN);
+            put(marker, new JSONObject().put("local_sha256", sha256(NEW)).put("cloud_sha256", sha256(OLD)).toString(), NOW);
+            JSONObject exitReport = f.sync("after-exit");
+            check(!f.action(exitReport, RUN).equals("upload"), "absent local save uploaded");
+            check(get(f.cloud(RUN)).equals(OLD), "cloud deleted or modified by marker when local absent");
+            check(marker.exists(), "marker consumed when local save absent");
         });
         System.out.println("AutoCloud tests passed=" + passed + " failed=" + failed);
         if (failed > 0) System.exit(1);

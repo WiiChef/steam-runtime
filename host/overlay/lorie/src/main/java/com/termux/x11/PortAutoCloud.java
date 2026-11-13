@@ -111,6 +111,17 @@ public final class PortAutoCloud {
         return result.toString();
     }
 
+    static String sha256(byte[] bytes) throws Exception {
+        byte[] digest = MessageDigest.getInstance("SHA-256").digest(bytes);
+        StringBuilder result = new StringBuilder();
+        for (byte b : digest) result.append(String.format(Locale.ROOT, "%02x", b & 255));
+        return result.toString();
+    }
+
+    static String pathHash(String name) throws Exception {
+        return sha256(name.getBytes(StandardCharsets.UTF_8));
+    }
+
     private static File safe(File root, String relative) throws IOException {
         File f = new File(root, relative);
         if (!f.getCanonicalPath().startsWith(root.getCanonicalPath() + File.separator))
@@ -166,6 +177,7 @@ public final class PortAutoCloud {
     static final class Save {
         final byte[] bytes;
         final String sha;
+        final String sha256;
         final long modified;
         Save(File file) throws Exception {
             long size = file.length();
@@ -177,6 +189,7 @@ public final class PortAutoCloud {
                 throw new IOException("Save is being written; retry on next pass");
             validateJson(bytes);
             sha = hash(bytes);
+            sha256 = sha256(bytes);
         }
         void unchanged(File file) throws Exception {
             if (!file.isFile() || modified != file.lastModified() || !Arrays.equals(bytes, Files.readAllBytes(file.toPath())))
@@ -250,8 +263,96 @@ public final class PortAutoCloud {
         }
     }
 
+    static final class Resolution {
+        final File markerFile;
+        final String expectedLocalSha256;
+        final String expectedCloudSha256;
+        Resolution(File markerFile, String local, String cloud) {
+            this.markerFile = markerFile;
+            this.expectedLocalSha256 = local;
+            this.expectedCloudSha256 = cloud;
+        }
+        boolean matches(String localSha256, String cloudSha256) {
+            if (expectedLocalSha256 == null || expectedCloudSha256 == null) return false;
+            if (localSha256 == null || cloudSha256 == null) return false;
+            return expectedLocalSha256.equalsIgnoreCase(localSha256) &&
+                   expectedCloudSha256.equalsIgnoreCase(cloudSha256);
+        }
+    }
+
+    static Resolution readResolutionMarker(File host, int appid, String name) {
+        File dir = new File(host, "autocloud");
+        File resolveDir = new File(dir, appid + ".resolve");
+        if (!resolveDir.isDirectory()) return null;
+        List<File> candidates = new ArrayList<>();
+        try {
+            candidates.add(new File(resolveDir, pathHash(name) + ".prefer-local"));
+            candidates.add(new File(resolveDir, hash(name.getBytes(StandardCharsets.UTF_8)) + ".prefer-local"));
+            candidates.add(new File(resolveDir, name.replace('/', '_') + ".prefer-local"));
+        } catch (Exception ignored) {}
+        File marker = null;
+        for (File c : candidates) {
+            if (c.isFile()) { marker = c; break; }
+        }
+        if (marker == null) return null;
+        try {
+            String content = read(marker).trim();
+            String local = null;
+            String cloud = null;
+            if (content.startsWith("{")) {
+                JSONObject obj = new JSONObject(content);
+                local = string(obj, "local_sha256", string(obj, "local", string(obj, "local_sha", null)));
+                cloud = string(obj, "cloud_sha256", string(obj, "cloud", string(obj, "cloud_sha", null)));
+            } else {
+                for (String line : content.split("\\r?\\n")) {
+                    line = line.trim();
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+                    String lower = line.toLowerCase(Locale.ROOT);
+                    Matcher m = Pattern.compile("([0-9a-fA-F]{64})").matcher(line);
+                    if (m.find()) {
+                        String h = m.group(1);
+                        if (lower.contains("local") || lower.contains("quest")) local = h;
+                        else if (lower.contains("cloud") || lower.contains("steam")) cloud = h;
+                        else if (local == null) local = h;
+                        else if (cloud == null) cloud = h;
+                    }
+                }
+            }
+            if (local != null && cloud != null) {
+                return new Resolution(marker, local, cloud);
+            }
+        } catch (Exception e) {
+            Log.w("PortAutoCloud", "Cannot parse resolution marker " + marker + ": " + e.getMessage());
+        }
+        return null;
+    }
+
+    static void recordResolutionInStatus(File host, int appid, String name, String localSha256, String cloudSha256, long now) {
+        File statusFile = new File(host, "status.json");
+        try {
+            JSONObject status = statusFile.isFile() ? new JSONObject(read(statusFile)) : new JSONObject();
+            JSONObject res = new JSONObject()
+                .put("appid", appid)
+                .put("file", name)
+                .put("action", "prefer-local")
+                .put("local_sha256", localSha256)
+                .put("cloud_sha256", cloudSha256)
+                .put("resolved_at", now);
+            status.put("autocloud_resolved", res);
+            status.put("autocloud_resolution", res);
+            writeStatusSnapshot(statusFile, status.toString(2));
+        } catch (Exception e) {
+            Log.w("PortAutoCloud", "Cannot record resolution in status.json: " + e.getMessage());
+        }
+    }
+
     static String decide(String local, String cloud, JSONObject previous, String change,
                          long qt, long ct, long now, boolean upload) {
+        return decide(local, cloud, previous, change, qt, ct, now, upload, false);
+    }
+
+    static String decide(String local, String cloud, JSONObject previous, String change,
+                         long qt, long ct, long now, boolean upload, boolean preferLocal) {
         // A durable deletion intent may precede removal of the old mirror bytes.
         // Only those exact bytes belong to the deletion we staged.
         if (previous != null && previous.has("deleted_cloud_sha") && previous.isNull("cloud_sha") &&
@@ -269,19 +370,28 @@ public final class PortAutoCloud {
             return ct > now || ct < 0 ? "clock conflict" : (cloud == null ? "content conflict" : "download");
         }
         if (local.equals(cloud)) return "identical";
-        if (qt > now || ct > now || qt < 0 || ct < 0) return "clock conflict";
+        if (qt > now || ct > now || qt < 0 || ct < 0) {
+            if (preferLocal) return upload ? "upload" : "upload disabled";
+            return "clock conflict";
+        }
         if (reconciled(previous)) {
             boolean localChanged = !local.equals(string(previous, "local_sha", null));
             String previousCloud = string(previous, "cloud_sha", null);
             boolean cloudChanged = !Objects.equals(cloud, previousCloud);
-            if (localChanged && cloudChanged) return "content conflict";
+            if (localChanged && cloudChanged) {
+                if (preferLocal) return upload ? "upload" : "upload disabled";
+                return "content conflict";
+            }
             if (cloudChanged) return cloud == null ? "content conflict" : "download";
             if (localChanged) return upload ? "upload" : "upload disabled";
             return "pending Steam acknowledgement";
         }
         if (cloud == null) return upload ? "upload" : "upload disabled";
         long delta = qt - ct;
-        if (Math.abs(delta) <= TIME_MARGIN) return "clock conflict";
+        if (Math.abs(delta) <= TIME_MARGIN) {
+            if (preferLocal) return upload ? "upload" : "upload disabled";
+            return "clock conflict";
+        }
         return delta < 0 ? "download" : (upload ? "upload" : "upload disabled");
     }
 
@@ -406,11 +516,22 @@ public final class PortAutoCloud {
                     Save remoteSave = meta == null || deleted || !cloud.isFile() ? null : new Save(cloud);
                     if (remoteSave != null && !remoteSave.sha.equalsIgnoreCase(meta.get("sha")))
                         throw new IOException("Cloud cache hash mismatch");
+                    Resolution resolution = readResolutionMarker(host, appid, name);
+                    boolean preferLocal = false;
+                    if (resolution != null && localSave != null && remoteSave != null) {
+                        if (resolution.matches(localSave.sha256, remoteSave.sha256)) {
+                            preferLocal = true;
+                        } else {
+                            Log.w("PortAutoCloud", "Resolution marker SHA mismatch for " + name);
+                            row.put("resolution_error", "SHA mismatch");
+                        }
+                    }
                     long qt = localSave == null ? 0 : localSave.modified / 1000L;
                     long ct = remoteSave == null ? 0 : Long.parseLong(meta.get("remotetime"));
                     String action = decide(localSave == null ? null : localSave.sha,
-                        remoteSave == null ? null : remoteSave.sha, previous, change, qt, ct, now, upload);
+                        remoteSave == null ? null : remoteSave.sha, previous, change, qt, ct, now, upload, preferLocal);
                     row.put("action", action).put("quest_time", qt).put("cloud_time", ct);
+                    if (preferLocal) row.put("resolution", "prefer-local");
                     if (!read(cache).equals(snapshot)) throw new IOException("Cloud inventory changed");
                     if (localSave != null) localSave.unchanged(local);
                     if (remoteSave != null) remoteSave.unchanged(cloud);
@@ -462,17 +583,57 @@ public final class PortAutoCloud {
                         // Steam must acknowledge these staged bytes in its next inventory.
                         // A different validated cloud hash is a subsequent cloud change.
                         history.put(name, record(localSave.sha, localSave.sha, change, qt));
+                        if (preferLocal && resolution != null) {
+                            try {
+                                Files.deleteIfExists(resolution.markerFile.toPath());
+                                Log.i("PortAutoCloud", "Consumed resolution marker: " + resolution.markerFile.getName());
+                            } catch (Exception e) {
+                                Log.w("PortAutoCloud", "Cannot delete resolution marker: " + e.getMessage());
+                            }
+                            recordResolutionInStatus(host, appid, name, localSave.sha256, remoteSave != null ? remoteSave.sha256 : null, now);
+                        }
                     } else if (action.equals("identical")) {
                         history.put(name, record(localSave.sha, remoteSave.sha, change, ct));
                     } else if (action.contains("conflict")) {
                         if (remoteSave != null) row.put("conflict", conflict(quest, name, remoteSave.bytes, ct));
                         Log.i("PortAutoCloud", "Divergent saves retained; " + action);
+                        String pathHash = pathHash(name);
+                        String markerPath = "files/autocloud/" + appid + ".resolve/" + pathHash + ".prefer-local";
+                        row.put("local_sha256", localSave != null ? localSave.sha256 : JSONObject.NULL);
+                        row.put("cloud_sha256", remoteSave != null ? remoteSave.sha256 : JSONObject.NULL);
+                        row.put("path_hash", pathHash);
+                        row.put("resolution_marker", markerPath);
+                        String dryRunLine = "pending conflict: " + name +
+                            " local_sha256=" + (localSave != null ? localSave.sha256 : "null") +
+                            " cloud_sha256=" + (remoteSave != null ? remoteSave.sha256 : "null") +
+                            " marker=" + markerPath;
+                        row.put("dry_run", dryRunLine);
                     }
                     write(stateFile, state.toString(2).getBytes(StandardCharsets.UTF_8), now);
                 } catch (Exception e) {
                     row.put("action", "blocked; " + e.getMessage());
                     Log.w("PortAutoCloud", "File reconciliation blocked; " + e.getMessage());
                 }
+            }
+            JSONArray pendingConflicts = new JSONArray();
+            List<String> dryRunLines = new ArrayList<>();
+            for (int i = 0; i < rows.length(); i++) {
+                JSONObject r = rows.optJSONObject(i);
+                if (r != null && r.optString("action", "").contains("conflict")) {
+                    JSONObject pc = new JSONObject();
+                    pc.put("file", r.optString("file"));
+                    pc.put("action", r.optString("action"));
+                    pc.put("local_sha256", r.opt("local_sha256"));
+                    pc.put("cloud_sha256", r.opt("cloud_sha256"));
+                    pc.put("path_hash", r.opt("path_hash"));
+                    pc.put("marker", r.opt("resolution_marker"));
+                    pendingConflicts.put(pc);
+                    if (r.has("dry_run")) dryRunLines.add(r.getString("dry_run"));
+                }
+            }
+            if (pendingConflicts.length() > 0) {
+                report.put("pending_conflicts", pendingConflicts);
+                report.put("dry_run", String.join("\n", dryRunLines));
             }
             report.put("ok", online && report.optBoolean("start_allowed", true));
         } catch (Exception e) {
