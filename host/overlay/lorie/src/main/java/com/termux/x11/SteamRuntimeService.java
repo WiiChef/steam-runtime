@@ -115,19 +115,25 @@ public class SteamRuntimeService extends Service {
                             if (liveStart < 0 && new File("/proc/" + pid).exists()) continue;
                             if (liveStart == registeredStart) continue;
                             if (findSteamPid() <= 0) continue;
-                            Log.i(TAG, "Reaping exited port process pid=" + pid + " appid=" + data[0]);
-                            entry.setLastModified(now);
                             String appid = data[0];
-                            if ("2742830".equals(appid)) PortAutoCloud.sync(this, 2742830,
-                                new File("/sdcard/Android/data/com.game.monstertrain2/files"), "after-exit");
-                            String result = runInProot("SteamAppId=" + appid + " SteamGameId=" + appid
-                                    + " timeout 5 /usr/local/bin/steamstate /root/steamrtarm64 " + appid, 7);
-                            if (result != null && result.contains("\"ok\":true")) {
-                                Log.i(TAG, "Port session released appid=" + appid + " without restarting Steam");
-                                entry.delete();
-                            } else {
-                                Log.w(TAG, "Port session release pending appid=" + appid + " helper result unavailable");
-                            }
+                            PortAutoCloud.afterExit(getFilesDir(), Integer.parseInt(appid),
+                                () -> hasLivePortProcess(appid), () -> {
+                                Log.i(TAG, "Reaping exited port process pid=" + pid + " appid=" + appid);
+                                entry.setLastModified(now);
+                                if ("2742830".equals(appid)) PortAutoCloud.syncLocked(getFilesDir(), 2742830,
+                                    new File("/sdcard/Android/data/com.game.monstertrain2/files"), "after-exit");
+                                return null;
+                            }, () -> {
+                                String result = runInProot("SteamAppId=" + appid + " SteamGameId=" + appid
+                                        + " timeout 5 /usr/local/bin/steamstate /root/steamrtarm64 " + appid, 7);
+                                if (result != null && result.contains("\"ok\":true")) {
+                                    Log.i(TAG, "Port session released appid=" + appid + " without restarting Steam");
+                                    entry.delete();
+                                } else {
+                                    Log.w(TAG, "Port session release pending appid=" + appid + " helper result unavailable");
+                                }
+                                return null;
+                            });
                         } catch (Exception e) {
                             Log.w(TAG, "Port process watcher error: " + e.getMessage());
                         }
@@ -138,6 +144,37 @@ public class SteamRuntimeService extends Service {
         }, "port-process-watcher");
         portWatcherThread.setDaemon(true);
         portWatcherThread.start();
+    }
+
+    /** Include pre-SteamAPI processes, which have not written a registration yet. */
+    private boolean hasLivePortProcess(String appid) {
+        File[] registrations = new File(getFilesDir(), "port-processes").listFiles();
+        if (registrations != null) for (File file : registrations) {
+            if (!file.getName().matches("[0-9]+")) continue;
+            String[] data = readPortRegistration(file);
+            if (data == null || !appid.equals(data[0])) continue;
+            int pid = Integer.parseInt(file.getName());
+            long start = processStartTime(pid);
+            if (start == Long.parseLong(data[1]) || (start < 0 && new File("/proc/" + pid).exists())) return true;
+        }
+        String packageName = null;
+        for (KnownPort port : KNOWN_PORTS) {
+            if (Integer.toString(port.steamAppId).equals(appid)) packageName = port.packageName;
+        }
+        if (packageName == null) return false;
+        File[] processes = new File("/proc").listFiles();
+        if (processes == null) return true;
+        for (File process : processes) {
+            if (!process.getName().matches("[0-9]+")) continue;
+            try {
+                byte[] bytes = Files.readAllBytes(new File(process, "cmdline").toPath());
+                int end = 0;
+                while (end < bytes.length && bytes[end] != 0) end++;
+                String name = new String(bytes, 0, end, StandardCharsets.UTF_8);
+                if (name.equals(packageName) || name.startsWith(packageName + ":")) return true;
+            } catch (IOException ignored) { }
+        }
+        return false;
     }
 
     private String[] readPortRegistration(File file) {
