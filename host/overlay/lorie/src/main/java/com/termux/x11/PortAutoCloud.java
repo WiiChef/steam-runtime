@@ -203,11 +203,11 @@ public final class PortAutoCloud {
                          long qt, long ct, long now, boolean upload) {
         if (local == null) {
             if (previous != null) {
-                // Only a reconciled cloud revision can prove that a PC changed this file.
-                // Legacy seen_local-only records retain their local deletion protection.
-                boolean cloudChanged = previous.has("cloud_sha") && cloud != null &&
-                    (!cloud.equals(previous.optString("cloud_sha")) ||
-                     !change.equals(previous.optString("cloud_change_number")));
+                // App-wide ChangeNumber cannot identify a change to this file.
+                // Unreconciled history compares against the last validated local bytes.
+                String baseline = previous.has("cloud_sha") ? previous.optString("cloud_sha") :
+                    previous.optString("seen_local_sha", previous.optString("local_sha", null));
+                boolean cloudChanged = cloud != null && baseline != null && !cloud.equals(baseline);
                 if (!cloudChanged) return "local deletion";
             }
             return ct > now || ct < 0 ? "clock conflict" : "download";
@@ -227,6 +227,25 @@ public final class PortAutoCloud {
         long delta = qt - ct;
         if (Math.abs(delta) > MAX_SKEW || Math.abs(delta) <= TIME_MARGIN) return "clock conflict";
         return delta < 0 ? "download" : (upload ? "upload" : "upload disabled");
+    }
+
+    // RunHistoryDataJson.RunEntry embeds the full submitted RunAggregateData as JSON.
+    // For single-player runs this is recorded on end/abandon, before the local save is removed.
+    private static Save completedRunHistory(File quest, Save cloud) throws Exception {
+        String id = new JSONObject(new String(cloud.bytes, StandardCharsets.UTF_8)).optString("id");
+        File file = safe(quest, "run-history/RunHistory.json");
+        if (id.isEmpty() || !file.isFile()) return null;
+        Save history = new Save(file);
+        JSONArray entries = new JSONObject(new String(history.bytes, StandardCharsets.UTF_8)).optJSONArray("_runEntries");
+        if (entries == null) return null;
+        for (int i = 0; i < entries.length(); i++) {
+            JSONObject entry = entries.optJSONObject(i);
+            if (entry == null || !id.equals(entry.optString("runId")) || !entry.optBoolean("isFull")) continue;
+            JSONObject run = new JSONObject(entry.getString("runDataJson"));
+            if (id.equals(run.optString("id")) && run.optBoolean("isFull") &&
+                run.has("endless") && !run.getBoolean("endless")) return history;
+        }
+        return null;
     }
 
     public static JSONObject sync(Context context, int appid, File quest, String phase) {
@@ -314,11 +333,15 @@ public final class PortAutoCloud {
                         history.put(name, new JSONObject().put("seen_local", true));
                         write(stateFile, state.toString(2).getBytes(StandardCharsets.UTF_8), now);
                     }
+                    Save localSave = local.isFile() ? new Save(local) : null;
+                    JSONObject previous = history.optJSONObject(name);
+                    if (localSave != null && previous != null && !previous.has("cloud_sha")) {
+                        previous.put("seen_local_sha", localSave.sha);
+                        write(stateFile, state.toString(2).getBytes(StandardCharsets.UTF_8), now);
+                    }
                     Save remoteSave = meta == null ? null : new Save(cloud);
                     if (remoteSave != null && !remoteSave.sha.equalsIgnoreCase(meta.get("sha")))
                         throw new IOException("Cloud cache hash mismatch");
-                    Save localSave = local.isFile() ? new Save(local) : null;
-                    JSONObject previous = history.optJSONObject(name);
                     long qt = localSave == null ? 0 : localSave.modified / 1000L;
                     long ct = meta == null ? 0 : Long.parseLong(meta.get("remotetime"));
                     String action = decide(localSave == null ? null : localSave.sha,
@@ -329,8 +352,22 @@ public final class PortAutoCloud {
                     if (remoteSave != null) remoteSave.unchanged(cloud);
                     if (action.equals("local deletion")) {
                         row.put("action", "local deletion retained; cloud deletion not staged");
-                        // A missing local file may be a crashed delete-and-rename save.
-                        // Never remove a mirror file or propagate a cloud deletion.
+                        // All other missing files retain delete-and-rename crash protection.
+                        if (upload && name.equals("saves/save-singlePlayer.json") && remoteSave != null &&
+                            previous != null && remoteSave.sha.equals(previous.optString("cloud_sha")) &&
+                            ct >= 0 && ct <= now) {
+                            Save completion = completedRunHistory(quest, remoteSave);
+                            if (completion != null) {
+                                row.put("conflict", conflict(quest, name, remoteSave.bytes, ct));
+                                if (!new File(dir, appid + ".allow-uploads").isFile()) throw new IOException("Upload marker removed");
+                                completion.unchanged(safe(quest, "run-history/RunHistory.json"));
+                                if (local.exists()) throw new IOException("Local save appeared before deletion");
+                                remoteSave.unchanged(cloud);
+                                if (!read(cache).equals(snapshot)) throw new IOException("Cloud inventory changed");
+                                Files.delete(cloud.toPath());
+                                row.put("action", "completed run cloud deletion staged");
+                            }
+                        }
                         Log.i("PortAutoCloud", row.getString("action"));
                     } else if (action.equals("download") && remoteSave != null) {
                         if (localSave != null) row.put("conflict", conflict(quest, name, localSave.bytes, qt));
@@ -341,7 +378,7 @@ public final class PortAutoCloud {
                         if (localSave == null && previous == null) {
                             // Persist existence intent first. A failed history write must never
                             // leave a new local save that could later be resurrected after deletion.
-                            history.put(name, new JSONObject().put("seen_local", true));
+                            history.put(name, new JSONObject().put("seen_local", true).put("seen_local_sha", remoteSave.sha));
                             write(stateFile, state.toString(2).getBytes(StandardCharsets.UTF_8), now);
                         }
                         write(local, remoteSave.bytes, ct);
@@ -354,7 +391,9 @@ public final class PortAutoCloud {
                         if (remoteSave != null) remoteSave.unchanged(cloud);
                         if (!read(cache).equals(snapshot)) throw new IOException("Cloud inventory changed");
                         write(cloud, localSave.bytes, qt);
-                        history.put(name, record(localSave.sha, remoteSave == null ? null : remoteSave.sha, change, ct));
+                        // Steam must acknowledge these staged bytes in its next inventory.
+                        // A different validated cloud hash is a subsequent cloud change.
+                        history.put(name, record(localSave.sha, localSave.sha, change, qt));
                     } else if (action.equals("identical")) {
                         history.put(name, record(localSave.sha, remoteSave.sha, change, ct));
                     } else if (action.contains("conflict")) {

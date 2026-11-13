@@ -169,6 +169,45 @@ public class PortAutoCloudTest {
                 check(get(f.cloud(RUN)).equals(OLD) && !f.local(RUN).exists(), "cloud deletion or resurrection");
             }
         });
+        String finished = new JSONObject(OLD).put("id", "completed-run").toString();
+        String completedHistory = new JSONObject().put("_runEntries", new JSONArray().put(new JSONObject()
+            .put("runId", "completed-run").put("isFull", true).put("runDataJson", new JSONObject()
+                .put("id", "completed-run").put("isFull", true).put("endless", false).toString()))).toString();
+        test("completed run deletion stages only acknowledged single-player save", () -> {
+            Fixture f = new Fixture(); f.remote(RUN, finished, NOW - 1000); put(f.local(RUN), finished, NOW - 1000);
+            f.sync("before-start"); f.marker(); Files.delete(f.local(RUN).toPath());
+            put(f.local("run-history/RunHistory.json"), completedHistory, NOW - 100);
+            JSONObject report = f.sync("after-exit");
+            check(f.action(report, RUN).equals("completed run cloud deletion staged"), "completion not deleted");
+            check(!f.cloud(RUN).exists() && !f.local(RUN).exists(), "completed run survived");
+            check(f.action(f.sync("after-exit"), RUN).startsWith("skipped deleted/absent"), "deletion retry failed");
+            f.remote(RUN, NEW, NOW - 10);
+            check(f.action(f.sync("before-start"), RUN).equals("download"), "new PC run blocked after deletion");
+        });
+        for (String guard : new String[] {"startup", "no marker", "different run", "partial entry", "partial data",
+                "endless", "malformed history", "no baseline", "PC changed", "other file", "staging copy"}) {
+            test("completed run deletion guard " + guard, () -> {
+                Fixture f = new Fixture();
+                String name = guard.equals("other file") ? META : guard.equals("staging copy") ? "staging-save/" + RUN : RUN;
+                f.remote(name, finished, NOW - 1000); put(f.local(name), finished, NOW - 1000);
+                if (!guard.equals("no baseline")) f.sync("before-start");
+                if (!guard.equals("no marker")) f.marker();
+                Files.delete(f.local(name).toPath());
+                JSONObject history = new JSONObject(completedHistory);
+                JSONObject entry = history.getJSONArray("_runEntries").getJSONObject(0);
+                JSONObject data = new JSONObject(entry.getString("runDataJson"));
+                if (guard.equals("different run")) entry.put("runId", "another-run");
+                if (guard.equals("partial entry")) entry.put("isFull", false);
+                if (guard.equals("partial data")) data.put("isFull", false);
+                if (guard.equals("endless")) data.put("endless", true);
+                entry.put("runDataJson", data.toString());
+                put(f.local("run-history/RunHistory.json"), guard.equals("malformed history") ? "{" : history.toString(), NOW - 100);
+                if (guard.equals("PC changed")) f.remote(name, new JSONObject(finished).put("score", 999).toString(), NOW - 10);
+                String cloud = get(f.cloud(name));
+                f.sync(guard.equals("startup") ? "before-start" : "after-exit");
+                check(f.cloud(name).isFile() && get(f.cloud(name)).equals(cloud), "guard deleted cloud " + guard);
+            });
+        }
         test("deleted run then new PC run downloads", () -> {
             Fixture f = new Fixture(); f.baseline(); f.marker(); Files.delete(f.local(RUN).toPath());
             f.sync("after-exit"); f.remote(RUN, NEW, NOW - 500);
@@ -182,12 +221,49 @@ public class PortAutoCloudTest {
             check(f.action(f.sync("before-start"), RUN).equals("download"), "mtime overrode changed revision");
             check(get(f.local(RUN)).equals(NEW), "new content missing");
         });
-        test("deleted run with changed ChangeNumber downloads", () -> {
+        test("PC preference change cannot resurrect deleted run", () -> {
             Fixture f = new Fixture(); f.baseline(); Files.delete(f.local(RUN).toPath());
-            f.change = "13"; f.inventory();
-            check(f.action(f.sync("before-start"), RUN).equals("download"), "ChangeNumber ignored");
-            check(get(f.local(RUN)).equals(OLD), "revision download missing");
+            f.change = "13"; f.remote("preferences.json", NEW, NOW - 100);
+            JSONObject report = f.sync("before-start");
+            check(f.action(report, RUN).startsWith("local deletion"), "unrelated revision resurrected run");
+            check(!f.local(RUN).exists(), "finished run downloaded");
+            check(get(f.local("preferences.json")).equals(NEW), "PC preferences missing");
         });
+        for (String cloud : new String[] {OLD, NEW}) {
+            test("seen-local-only deleted run " + cloud, () -> {
+                Fixture f = new Fixture(); f.remote(RUN, OLD, NOW - 1000);
+                put(f.local(RUN), OLD, NOW + 3600);
+                check(f.action(f.sync("before-start"), RUN).equals("identical"), "initial baseline");
+                // Seed the state shape written when validation succeeds but reconciliation cannot finish.
+                JSONObject previous = new JSONObject().put("seen_local", true).put("seen_local_sha", sha(OLD));
+                put(new File(f.host, "autocloud/2742830-state.json"),
+                    new JSONObject().put("account", "123").put("files", new JSONObject().put(RUN, previous)).toString(), NOW);
+                Files.delete(f.local(RUN).toPath()); f.remote(RUN, cloud, NOW - 100);
+                String action = f.action(f.sync("before-start"), RUN);
+                check(cloud.equals(NEW) ? action.equals("download") : action.startsWith("local deletion"), "seen-local decision");
+                check(cloud.equals(NEW) ? get(f.local(RUN)).equals(NEW) : !f.local(RUN).exists(), "seen-local bytes");
+            });
+        }
+        test("seen-local hash recorded with uploads disabled then newer PC run downloads", () -> {
+            Fixture f = new Fixture(); f.remote(META, OLD, NOW - 1000); put(f.local(RUN), OLD, NOW - 500);
+            check(f.action(f.sync("before-start"), RUN).equals("upload disabled"), "unreconciled local file");
+            JSONObject previous = new JSONObject(get(new File(f.host, "autocloud/2742830-state.json")))
+                .getJSONObject("files").getJSONObject(RUN);
+            check(!previous.has("cloud_sha") && previous.getString("seen_local_sha").equals(sha(OLD)), "observed hash missing");
+            Files.delete(f.local(RUN).toPath()); f.remote(RUN, NEW, NOW - 100);
+            check(f.action(f.sync("before-start"), RUN).equals("download"), "new PC save blocked");
+            check(get(f.local(RUN)).equals(NEW), "PC bytes missing");
+        });
+        for (long time : new long[] {NOW + 3600, -1}) {
+            test("seen-local history rejects invalid PC time " + time, () -> {
+                Fixture f = new Fixture(); f.remote(META, OLD, NOW - 1000); put(f.local(RUN), OLD, NOW - 500);
+                f.sync("before-start"); Files.delete(f.local(RUN).toPath());
+                f.remote(RUN, NEW, NOW - 100); f.entry(RUN, sha(NEW), time, "0");
+                String action = f.action(f.sync("before-start"), RUN);
+                check(action.equals("clock conflict") || action.startsWith("blocked;"), "invalid time downloaded " + action);
+                check(!f.local(RUN).exists(), "invalid revision resurrected");
+            });
+        }
         test("failed changed-revision download retains baseline for retry", () -> {
             Fixture f = new Fixture(); f.baseline(); Files.delete(f.local(RUN).toPath());
             f.remote(RUN, NEW, NOW - 500);
@@ -224,8 +300,24 @@ public class PortAutoCloudTest {
         }
         test("observed unsynced file deletion", () -> {
             Fixture f = new Fixture(); f.remote(RUN, OLD, NOW - 1000); put(f.local(RUN), NEW, NOW - 100);
-            f.sync("before-start"); Files.delete(f.local(RUN).toPath()); f.marker(); f.sync("after-exit");
-            check(!f.local(RUN).exists() && get(f.cloud(RUN)).equals(OLD), "unsynced deletion changed cloud");
+            f.sync("before-start"); Files.delete(f.local(RUN).toPath()); f.marker();
+            check(f.action(f.sync("after-exit"), RUN).equals("download"), "different cloud hash suppressed");
+            check(get(f.local(RUN)).equals(OLD) && get(f.cloud(RUN)).equals(OLD), "different cloud copy lost");
+        });
+        test("cache mismatch preserves observed local hash for later PC run", () -> {
+            Fixture f = new Fixture(); f.remote(RUN, OLD, NOW - 1000); put(f.local(RUN), OLD, NOW - 500);
+            f.entry(RUN, sha(NEW), NOW - 100, "0");
+            check(f.action(f.sync("before-start"), RUN).startsWith("blocked;"), "cache mismatch accepted");
+            Files.delete(f.local(RUN).toPath()); f.remote(RUN, NEW, NOW - 100);
+            check(f.action(f.sync("before-start"), RUN).equals("download"), "local observation lost on remote failure");
+            check(get(f.local(RUN)).equals(NEW), "new PC revision missing");
+        });
+        test("legacy hashless seen-local history retains deletion protection", () -> {
+            Fixture f = new Fixture(); f.remote(RUN, OLD, NOW - 1000);
+            put(new File(f.host, "autocloud/2742830-state.json"), new JSONObject().put("account", "123")
+                .put("files", new JSONObject().put(RUN, new JSONObject().put("seen_local", true))).toString(), NOW);
+            check(f.action(f.sync("before-start"), RUN).startsWith("local deletion"), "unproven revision downloaded");
+            check(!f.local(RUN).exists(), "hashless legacy run resurrected");
         });
         test("new cloud file downloads", () -> {
             Fixture f = new Fixture(); f.remote(RUN, OLD, NOW - 1000);
@@ -280,6 +372,32 @@ public class PortAutoCloudTest {
             Fixture f = new Fixture(); f.baseline(); f.marker(); put(f.local(RUN), NEW, NOW - 100);
             check(f.action(f.sync("before-start"), RUN).equals("upload disabled"), "startup upload");
         });
+        for (boolean newFile : new boolean[] {false, true}) {
+            test("upload acknowledgement then local change uploads again " + newFile, () -> {
+                Fixture f = new Fixture();
+                if (newFile) f.remote(META, OLD, NOW - 1000); else f.baseline();
+                f.marker(); put(f.local(RUN), NEW, NOW - 100);
+                check(f.action(f.sync("after-exit"), RUN).equals("upload"), "first upload");
+                JSONObject previous = new JSONObject(get(new File(f.host, "autocloud/2742830-state.json")))
+                    .getJSONObject("files").getJSONObject(RUN);
+                check(previous.getString("cloud_sha").equals(sha(NEW)), "expected cloud hash is stale");
+                check(f.action(f.sync("before-start"), RUN).startsWith("blocked;"), "unacknowledged mirror accepted");
+                f.change = "13"; f.entry(RUN, sha(NEW), NOW - 100, "0");
+                String next = "{\"saveVersion\":3}"; put(f.local(RUN), next, NOW - 10);
+                check(f.action(f.sync("after-exit"), RUN).equals("upload"), "second upload falsely conflicted");
+                check(get(f.cloud(RUN)).equals(next), "second upload bytes");
+            });
+        }
+        for (boolean localChanged : new boolean[] {false, true}) {
+            test("different cloud revision after staging " + localChanged, () -> {
+                Fixture f = new Fixture(); f.baseline(); f.marker(); put(f.local(RUN), NEW, NOW - 100);
+                f.sync("after-exit"); String pc = "{\"saveVersion\":4}"; f.remote(RUN, pc, NOW - 50);
+                if (localChanged) put(f.local(RUN), "{\"saveVersion\":3}", NOW - 10);
+                check(f.action(f.sync("after-exit"), RUN).equals(localChanged ? "content conflict" : "download"),
+                    "real cloud change ignored");
+                check(get(f.cloud(RUN)).equals(pc), "PC change overwritten");
+            });
+        }
         test("validated upload retains loser", () -> {
             Fixture f = new Fixture(); f.baseline(); f.marker(); put(f.local(RUN), NEW, NOW - 100);
             JSONObject result = f.sync("after-exit");
